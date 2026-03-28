@@ -1,0 +1,25 @@
+# Node
+node_modules/
+dist/
+.next/
+out/
+build/
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.db-journal
+p2p-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
