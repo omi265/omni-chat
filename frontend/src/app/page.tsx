@@ -1,8 +1,8 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import ChatRoom from '../components/ChatRoom';
 import AdminPanel from '../components/AdminPanel';
+import ServerWorkspace from '../components/ServerWorkspace';
 import UserSettingsModal from '../components/UserSettingsModal';
 import { deriveKeyPair } from '../lib/crypto';
 import { getSocket } from '../lib/socket';
@@ -251,7 +251,8 @@ export default function Home() {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
         {view === 'server' && activeServerId ? (
-          <ChatRoom 
+          <ServerWorkspace
+            key={activeServerId}
             roomId={activeServerId} 
             username={username} 
             joinedServers={joinedServers}

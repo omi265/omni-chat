@@ -5,13 +5,19 @@ const getBackendUrl = () => {
     return process.env.NEXT_PUBLIC_BACKEND_URL;
   }
   
-  // In a unified server setup, we can just use a relative path
-  // or the current origin. This works perfectly with proxies/subdomains.
   if (typeof window !== 'undefined') {
-    return window.location.origin;
+    const { protocol, hostname, port, origin } = window.location;
+
+    // In local split-dev, Next runs on 3000 and the backend runs on 3001.
+    if (port === '3000') {
+      return `${protocol}//${hostname}:3001`;
+    }
+
+    // In the unified production/static setup, frontend and backend share one origin.
+    return origin;
   }
   
-  return 'http://localhost:2650';
+  return 'http://localhost:3001';
 };
 
 let socket: Socket | null = null;
