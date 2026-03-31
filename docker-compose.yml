@@ -12,6 +12,35 @@ services:
       - DATA_DIR=/data
       - NODE_ENV=production
       - SUPER_ADMIN_USERNAME=admin # Change this if needed
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=omni
+      - MINIO_SECRET_KEY=omni-secret-key
+      - MINIO_BUCKET=omni-thumbs
+      - MINIO_USE_SSL=false
+    depends_on:
+      - minio
+    networks:
+      - proxy-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: omni-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9005:9000" # API Port for local development
+      - "9006:9001" # Web Console Port
+    environment:
+      - MINIO_ROOT_USER=omni
+      - MINIO_ROOT_PASSWORD=omni-secret-key
+    volumes:
+      - ./minio-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
     networks:
       - proxy-network
 

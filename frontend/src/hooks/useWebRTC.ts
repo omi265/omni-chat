@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { getSocket } from '../lib/socket';
+import { getBackendUrl, getSocket } from '../lib/socket';
 import { 
   getPersistentKeyPair, 
   KeyPair,
@@ -53,9 +53,41 @@ export interface RoomFile {
   size: number;
   nonce: string;
   timestamp: number;
+  thumbKey?: string | null;
+  thumbType?: string | null;
+  thumbWidth?: number | null;
+  thumbHeight?: number | null;
+  previewStatus?: 'ready' | 'processing' | 'failed' | null;
   data?: Uint8Array; // Only present when downloading
   localUrl?: string; // Blob URL for previews
+  thumbUrl?: string | null;
 }
+
+const toUint8Array = (payload: unknown): Uint8Array => {
+  if (payload instanceof Uint8Array) return payload;
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  if (Array.isArray(payload)) return Uint8Array.from(payload);
+  if (payload && typeof payload === 'object') {
+    if ('data' in payload && Array.isArray((payload as { data?: unknown }).data)) {
+      return Uint8Array.from((payload as { data: number[] }).data);
+    }
+    if (
+      'buffer' in payload &&
+      (payload as { buffer?: unknown }).buffer instanceof ArrayBuffer &&
+      typeof (payload as { byteOffset?: unknown }).byteOffset === 'number' &&
+      typeof (payload as { byteLength?: unknown }).byteLength === 'number'
+    ) {
+      const typed = payload as { buffer: ArrayBuffer; byteOffset: number; byteLength: number };
+      return new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength);
+    }
+  }
+  return new Uint8Array();
+};
+
+const withPreviewUrl = (file: RoomFile): RoomFile => ({
+  ...file,
+  thumbUrl: file.previewStatus === 'ready' && file.thumbKey ? `${getBackendUrl()}/media/thumb/${file.id}` : null,
+});
 
 export const useWebRTC = (roomId: string, username: string, localStream: MediaStream | null) => {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -66,6 +98,8 @@ export const useWebRTC = (roomId: string, username: string, localStream: MediaSt
   const [keys, setKeys] = useState<KeyPair | null>(null);
   const [roomKey, setRoomKey] = useState<string | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
+  const [fileTransferError, setFileTransferError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
 
   const socket = getSocket();
   const peersRef = useRef<Map<string, PeerConnectionData>>(new Map());
@@ -104,17 +138,22 @@ export const useWebRTC = (roomId: string, username: string, localStream: MediaSt
     });
 
     socket.on('room-files-bulk', (files: RoomFile[]) => {
-      setRoomFiles(files);
+      setRoomFiles(files.map(withPreviewUrl));
     });
 
     socket.on('room-file', (file: RoomFile) => {
-      setRoomFiles(prev => [...prev, file]);
+      setFileTransferError(null);
+      setRoomFiles(prev => {
+        if (prev.some(existing => existing.id === file.id)) return prev;
+        return [...prev, withPreviewUrl(file)];
+      });
     });
 
     socket.on('room-file-data', (fileData: any) => {
       if (!rk) return;
       try {
-        const decrypted = decryptFile(fileData.data, fileData.nonce, rk);
+        const encryptedBytes = toUint8Array(fileData.data);
+        const decrypted = decryptFile(encryptedBytes, fileData.nonce, rk);
         // Casting to any to bypass TS error regarding Uint8Array buffer compatibility with BlobPart
         const blob = new Blob([decrypted as any], { type: fileData.type });
         const url = URL.createObjectURL(blob);
@@ -319,11 +358,25 @@ export const useWebRTC = (roomId: string, username: string, localStream: MediaSt
   };
 
   const sendFile = async (file: File) => {
-    if (!roomKey) return;
+    console.log('sendFile triggered for:', file.name, file.size, file.type);
+    if (!roomKey) {
+      console.error('No roomKey available for encryption');
+      return;
+    }
+    setIsUploading(true);
     const reader = new FileReader();
     reader.onload = async () => {
       const data = new Uint8Array(reader.result as ArrayBuffer);
       const encrypted = encryptFile(data, roomKey);
+      
+      const isImage = file.type.startsWith('image/') || 
+                      file.name.toLowerCase().endsWith('.png') || 
+                      file.name.toLowerCase().endsWith('.jpg') || 
+                      file.name.toLowerCase().endsWith('.jpeg') || 
+                      file.name.toLowerCase().endsWith('.webp') || 
+                      file.name.toLowerCase().endsWith('.gif');
+
+      const previewData = isImage ? data : undefined;
       
       const fileObj = {
         id: Math.random().toString(36).substring(7),
@@ -333,11 +386,53 @@ export const useWebRTC = (roomId: string, username: string, localStream: MediaSt
         type: file.type,
         size: file.size,
         data: encrypted.data,
+        previewData,
         nonce: encrypted.nonce,
         timestamp: Date.now()
       };
 
-      socket.emit('send-room-file', { roomId, channelId: activeChannelId, file: fileObj });
+      console.log('Emitting send-room-file event', { id: fileObj.id, name: fileObj.name });
+      socket.emit(
+        'send-room-file',
+        { roomId, channelId: activeChannelId, file: fileObj },
+        (response: {
+          ok: boolean;
+          fileId?: string;
+          message?: string;
+          thumbKey?: string | null;
+          thumbType?: string | null;
+          thumbWidth?: number | null;
+          thumbHeight?: number | null;
+          previewStatus?: 'ready' | 'processing' | 'failed' | null;
+        }) => {
+          setIsUploading(false);
+          console.log('Received response from send-room-file', response);
+          if (!response?.ok) {
+            setFileTransferError(response?.message || 'Failed to upload file');
+            return;
+          }
+          setFileTransferError(null);
+          setRoomFiles(prev => {
+            if (prev.some(existing => existing.id === fileObj.id)) return prev;
+            return [
+              ...prev,
+              withPreviewUrl({
+                ...fileObj,
+                data: undefined,
+                thumbKey: response.thumbKey ?? null,
+                thumbType: response.thumbType ?? null,
+                thumbWidth: response.thumbWidth ?? null,
+                thumbHeight: response.thumbHeight ?? null,
+                previewStatus: response.previewStatus ?? null,
+              }),
+            ];
+          });
+        }
+      );
+    };
+    reader.onerror = () => {
+      setIsUploading(false);
+      setFileTransferError('Failed to read file from device');
     };
     reader.readAsArrayBuffer(file);
   };
@@ -391,6 +486,8 @@ export const useWebRTC = (roomId: string, username: string, localStream: MediaSt
     joinVoiceChannel,
     leaveVoiceChannel,
     broadcastSpeaking,
-    isReady: !!keys && !!roomKey 
+    isReady: !!keys && !!roomKey,
+    fileTransferError,
+    isUploading,
   };
 };

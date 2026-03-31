@@ -20,7 +20,7 @@ interface ChatRoomProps {
 }
 
 export default function ChatRoom({ roomId, username, joinedServers, onSwitchServer, onLeaveHome }: ChatRoomProps) {
-  const { localStream, startStream, stopStream, toggleMute, toggleDeafen, isMuted, isDeafened, isSpeaking: isLocallySpeaking } = useMediaStream();
+  const { localStream, startStream, stopStream, toggleMute, toggleDeafen, isMuted, isDeafened, isSpeaking: isLocallySpeaking, mediaError } = useMediaStream();
   
   const [avatarColor, setAvatarColor] = useState(typeof window !== 'undefined' ? localStorage.getItem('p2p_avatar_color') || '#5865F2' : '#5865F2');
   const [avatarUrl, setAvatarUrl] = useState<string | null>(typeof window !== 'undefined' ? localStorage.getItem('p2p_avatar_url') : null);
@@ -43,7 +43,9 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
     leaveVoiceChannel,
     broadcastSpeaking, 
     remoteStreams,
-    isReady 
+    isReady,
+    fileTransferError,
+    isUploading,
   } = useWebRTC(roomId, username, localStream);
   
   const [inputText, setInputText] = useState('');
@@ -100,6 +102,7 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    console.log('handleFileChange selected file:', file?.name);
     if (file) {
       if (file.size > 20 * 1024 * 1024) {
         alert('File is too large (max 20MB)');
@@ -160,29 +163,61 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
 
   const renderFile = (file: RoomFile) => {
     const isImage = file.type.startsWith('image/');
+    const isPdf = file.type === 'application/pdf';
+    const isMarkdown = file.name.endsWith('.md');
+    const previewSrc = file.localUrl || file.thumbUrl;
+
     return (
-      <div key={file.id} className="mt-2 bg-[#2b2d31] border border-[#1e1f22] rounded-lg p-3 max-w-full sm:max-w-sm">
-        {isImage && file.localUrl ? (
-          <img src={file.localUrl} className="max-h-64 rounded mb-2 object-contain w-full" alt={file.name} />
-        ) : isImage ? (
-          <div className="h-32 bg-[#1e1f22] rounded flex items-center justify-center mb-2">
-            <button onClick={() => downloadFile(file.id)} className="text-indigo-400 text-xs font-bold hover:underline italic">Click to load image</button>
+      <div key={file.id} className="mt-2 bg-[#2b2d31] border border-[#1e1f22] rounded-lg p-3 max-w-full sm:max-w-sm shadow-sm overflow-hidden">
+        {isImage && previewSrc ? (
+          <div className="relative group mb-2">
+            <img src={previewSrc} className="max-h-64 rounded object-contain w-full bg-[#1e1f22] border border-white/5" alt={file.name} />
+            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40 rounded">
+               {file.localUrl ? (
+                 <a href={file.localUrl} target="_blank" rel="noopener noreferrer" className="bg-green-600 text-white px-4 py-2 rounded-full text-xs font-bold shadow-xl hover:bg-green-500 transition-colors">
+                   Open Original
+                 </a>
+               ) : (
+                 <button onClick={() => downloadFile(file.id)} className="bg-indigo-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-xl hover:bg-indigo-400 transition-colors">
+                   Download Original
+                 </button>
+               )}
+            </div>
+          </div>
+        ) : isImage && file.previewStatus === 'processing' ? (
+          <div className="h-40 bg-[#1e1f22] rounded flex flex-col items-center justify-center mb-2 border border-dashed border-[#3f4147]">
+            <div className="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+            <span className="text-[10px] text-gray-400 uppercase font-bold tracking-widest">Generating Preview...</span>
           </div>
         ) : (
-          <div className="flex items-center space-x-3 mb-2">
-            <div className="bg-[#1e1f22] p-2 rounded text-2xl">📄</div>
-            <div className="min-w-0">
-              <div className="text-sm font-bold text-white truncate">{file.name}</div>
-              <div className="text-[10px] text-gray-400">{(file.size / 1024).toFixed(1)} KB</div>
+          <div className="flex items-center p-3 bg-[#1e1f22] rounded mb-2 border border-white/5">
+            <div className="w-12 h-12 flex-shrink-0 flex items-center justify-center rounded bg-[#2b2d31] mr-3 text-xl shadow-inner">
+              {isPdf ? '📕' : isMarkdown ? '📝' : '📄'}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-bold text-[#dbdee1] truncate">{file.name}</div>
+              <div className="text-[10px] text-gray-500 font-bold uppercase tracking-wider">{(file.size / 1024).toFixed(1)} KB • {isPdf ? 'PDF' : isMarkdown ? 'Markdown' : 'File'}</div>
             </div>
           </div>
         )}
-        {!file.localUrl && !isImage && (
-          <button onClick={() => downloadFile(file.id)} className="w-full bg-[#4e5058] py-1.5 rounded text-xs font-bold hover:bg-[#6d6f78] transition">Download File</button>
-        )}
-        {file.localUrl && !isImage && (
-          <a href={file.localUrl} download={file.name} className="block w-full bg-[#23a559] py-1.5 rounded text-xs font-bold text-white text-center hover:bg-[#1a8344] transition">Save to Device</a>
-        )}
+        
+        <div className="flex space-x-2">
+          {!file.localUrl ? (
+            <button onClick={() => downloadFile(file.id)} className="flex-1 bg-[#4e5058] py-2 rounded text-[11px] font-bold text-white hover:bg-[#6d6f78] transition flex items-center justify-center space-x-2">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+              <span>Download</span>
+            </button>
+          ) : (
+            <a href={file.localUrl} download={file.name} className="flex-1 bg-[#23a559] py-2 rounded text-[11px] font-bold text-white text-center hover:bg-[#1a8344] transition flex items-center justify-center space-x-2">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>
+              <span>Save to Device</span>
+            </a>
+          )}
+        </div>
+        
+        <div className="mt-2 text-[9px] text-gray-500/70 font-medium uppercase tracking-tighter text-right">
+          {new Date(file.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        </div>
       </div>
     );
   };
@@ -454,6 +489,16 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
             </div>
           ) : (
             <>
+              {fileTransferError && (
+                <div className="mx-4 mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+                  {fileTransferError}
+                </div>
+              )}
+              {mediaError && (
+                <div className="mx-4 mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 px-4 py-3 text-sm text-yellow-200">
+                  {mediaError}
+                </div>
+              )}
               <div className="flex-1 min-h-0 p-4 pb-0">
                 <div
                   ref={scrollRef}
@@ -470,6 +515,14 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
                 </div>
               </div>
 
+              <div className="px-4 shrink-0">
+                {isUploading && (
+                  <div className="flex items-center space-x-2 text-indigo-400 text-xs font-bold animate-pulse bg-indigo-500/5 py-2 px-3 rounded-t-lg border-x border-t border-[#1E1F22]">
+                    <div className="w-3 h-3 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="uppercase tracking-widest">Uploading file...</span>
+                  </div>
+                )}
+              </div>
               <div className="p-4 bg-[#313338] shrink-0">
                 <div className="bg-[#383A40] rounded-lg px-4 flex items-center shadow-inner">
                   <button onClick={() => fileInputRef.current?.click()} className="text-[#b5bac1] hover:text-[#dbdee1] p-2 mr-2 transition-colors"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg></button>

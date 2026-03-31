@@ -5,14 +5,24 @@ export const useMediaStream = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [isDeafened, setIsDeafened] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
 
   const startStream = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      const message = 'Voice capture is unavailable here. Use HTTPS or localhost to enable microphone access.';
+      console.error(message);
+      setMediaError(message);
+      return null;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setLocalStream(stream);
+      setMediaError(null);
       return stream;
     } catch (err) {
       console.error('Failed to get media stream', err);
+      setMediaError('Failed to access your microphone.');
       return null;
     }
   }, []);
@@ -45,6 +55,10 @@ export const useMediaStream = () => {
       return;
     }
 
+    if (typeof window === 'undefined' || (!window.AudioContext && !(window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)) {
+      return;
+    }
+
     const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     const analyser = audioContext.createAnalyser();
     const source = audioContext.createMediaStreamSource(localStream);
@@ -73,5 +87,5 @@ export const useMediaStream = () => {
     };
   }, [localStream, isMuted]);
 
-  return { localStream, startStream, stopStream, toggleMute, toggleDeafen, isMuted, isDeafened, isSpeaking };
+  return { localStream, startStream, stopStream, toggleMute, toggleDeafen, isMuted, isDeafened, isSpeaking, mediaError };
 };

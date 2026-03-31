@@ -16,6 +16,7 @@ npm-debug.log*
 *.db
 *.db-journal
 p2p-data/
+minio-data/
 
 # OS
 .DS_Store

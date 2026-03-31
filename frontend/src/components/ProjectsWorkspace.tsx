@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getSocket } from '../lib/socket';
+import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
 
 interface WorkspaceMember {
   username: string;
@@ -143,7 +144,7 @@ export default function ProjectsWorkspace({ roomId, username, workspaceReady }: 
   const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMember[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [currentProject, setCurrentProject] = useState<ProjectDetail | null>(null);
-  const [viewMode, setViewMode] = useState<'board' | 'list'>('board');
+  const [viewMode, setViewMode] = useState<'board' | 'table'>('board');
   const [error, setError] = useState<string | null>(null);
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -395,6 +396,71 @@ export default function ProjectsWorkspace({ roomId, username, workspaceReady }: 
     event.target.value = '';
   };
 
+  const onDragEnd = (result: DropResult) => {
+    const { destination, source, draggableId } = result;
+
+    if (!destination || !currentProject) return;
+
+    if (destination.droppableId === source.droppableId && destination.index === source.index) {
+      return;
+    }
+
+    const taskId = draggableId;
+    const nextStatusId = destination.droppableId;
+
+    // Find all tasks in the destination column
+    const columnTasks = currentProject.tasks
+      .filter((t) => t.statusId === nextStatusId)
+      .sort((a, b) => a.position - b.position);
+
+    let nextPosition: number;
+
+    if (columnTasks.length === 0) {
+      nextPosition = 1000;
+    } else if (destination.index === 0) {
+      nextPosition = columnTasks[0].position / 2;
+    } else if (destination.index >= columnTasks.length) {
+      nextPosition = columnTasks[columnTasks.length - 1].position + 1000;
+    } else {
+      // If moving within same column and index shifted
+      let adjustedTasks = [...columnTasks];
+      if (source.droppableId === nextStatusId) {
+        const movedTask = adjustedTasks.find(t => t.id === taskId);
+        if (movedTask) {
+          adjustedTasks = adjustedTasks.filter(t => t.id !== taskId);
+        }
+      }
+      
+      if (destination.index === 0) {
+        nextPosition = adjustedTasks[0].position / 2;
+      } else if (destination.index >= adjustedTasks.length) {
+        nextPosition = adjustedTasks[adjustedTasks.length - 1].position + 1000;
+      } else {
+        const prevTask = adjustedTasks[destination.index - 1];
+        const nextTask = adjustedTasks[destination.index];
+        nextPosition = (prevTask.position + nextTask.position) / 2;
+      }
+    }
+
+    socket.emit('task-update', {
+      taskId,
+      username,
+      updates: {
+        statusId: nextStatusId,
+        position: nextPosition,
+      },
+    });
+
+    // Optimistic update
+    const updatedTasks = currentProject.tasks.map((t) => {
+      if (t.id === taskId) {
+        return { ...t, statusId: nextStatusId, position: nextPosition };
+      }
+      return t;
+    });
+    setCurrentProject({ ...currentProject, tasks: updatedTasks });
+  };
+
   return (
     <div className="flex h-full min-h-0 bg-[#313338] text-gray-200">
       <aside className="flex w-72 shrink-0 flex-col border-r border-[#1E1F22] bg-[#232428]">
@@ -492,12 +558,12 @@ export default function ProjectsWorkspace({ roomId, username, workspaceReady }: 
                     Board
                   </button>
                   <button
-                    onClick={() => setViewMode('list')}
+                    onClick={() => setViewMode('table')}
                     className={`rounded-md px-3 py-2 text-sm font-semibold transition ${
-                      viewMode === 'list' ? 'bg-indigo-500 text-white' : 'bg-[#232428] text-[#b5bac1] hover:text-white'
+                      viewMode === 'table' ? 'bg-indigo-500 text-white' : 'bg-[#232428] text-[#b5bac1] hover:text-white'
                     }`}
                   >
-                    List
+                    Table
                   </button>
                   {canManageProject && (
                     <button
@@ -513,101 +579,130 @@ export default function ProjectsWorkspace({ roomId, username, workspaceReady }: 
 
             <div className="flex-1 min-h-0 overflow-hidden">
               {viewMode === 'board' ? (
-                <div className="flex h-full gap-4 overflow-x-auto overflow-y-hidden p-4">
-                  {statusesWithTasks.map((status) => (
-                    <section
-                      key={status.id}
-                      className="flex h-full min-h-0 w-[320px] shrink-0 flex-col rounded-xl border border-[#1E1F22] bg-[#232428]"
-                    >
-                      <div className="border-b border-[#1E1F22] p-4">
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="flex items-center gap-2">
-                            <span className="h-3 w-3 rounded-full" style={{ backgroundColor: status.color }} />
-                            <div className="font-semibold text-white">{status.name}</div>
-                            <span className="rounded-full bg-[#1E1F22] px-2 py-0.5 text-[10px] text-[#b5bac1]">
-                              {status.tasks.length}
-                            </span>
-                          </div>
-                        </div>
-
-                        {canEditProject && (
-                          <div className="mt-4 space-y-2">
-                            <input
-                              value={newTaskTitleByStatus[status.id] || ''}
-                              onChange={(event) =>
-                                setNewTaskTitleByStatus((prev) => ({ ...prev, [status.id]: event.target.value }))
-                              }
-                              placeholder="Quick add task"
-                              className="w-full rounded-md border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white placeholder:text-[#6d6f78] focus:outline-none"
-                            />
-                            <button
-                              onClick={() => createTask(status.id)}
-                              className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-emerald-600"
-                            >
-                              Add Task
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="flex-1 space-y-3 overflow-y-auto p-3">
-                        {status.tasks.map((task) => (
-                          <button
-                            key={task.id}
-                            onClick={() => setSelectedTaskId(task.id)}
-                            className="w-full rounded-lg border border-[#3F4147] bg-[#2B2D31] p-3 text-left transition hover:border-indigo-400 hover:bg-[#313338]"
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="font-semibold text-white">{task.title}</div>
-                              <span className={`rounded-full px-2 py-1 text-[10px] uppercase ${priorityClasses[task.priority]}`}>
-                                {task.priority}
+                <DragDropContext onDragEnd={onDragEnd}>
+                  <div className="flex h-full gap-4 overflow-x-auto overflow-y-hidden p-4">
+                    {statusesWithTasks.map((status) => (
+                      <section
+                        key={status.id}
+                        className="flex h-full min-h-0 w-[320px] shrink-0 flex-col rounded-xl border border-[#1E1F22] bg-[#232428]"
+                      >
+                        <div className="border-b border-[#1E1F22] p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <span className="h-3 w-3 rounded-full" style={{ backgroundColor: status.color }} />
+                              <div className="font-semibold text-white">{status.name}</div>
+                              <span className="rounded-full bg-[#1E1F22] px-2 py-0.5 text-[10px] text-[#b5bac1]">
+                                {status.tasks.length}
                               </span>
                             </div>
-                            {task.description && (
-                              <div className="mt-2 line-clamp-3 text-xs text-[#b5bac1]">{task.description}</div>
-                            )}
-                            <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#949ba4]">
-                              {task.assigneeUsername && <span>@{task.assigneeUsername}</span>}
-                              {task.dueAt && <span>Due {new Date(task.dueAt).toLocaleDateString()}</span>}
-                              <span>{task.comments.length} comments</span>
-                            </div>
-                          </button>
-                        ))}
-                        {!status.tasks.length && (
-                          <div className="rounded-lg border border-dashed border-[#3F4147] p-4 text-xs text-[#949ba4]">
-                            No tasks in this column yet.
                           </div>
-                        )}
-                      </div>
-                    </section>
-                  ))}
 
-                  {canEditProject && (
-                    <section className="w-[260px] shrink-0 rounded-xl border border-dashed border-[#3F4147] bg-[#232428]/70 p-4">
-                      <div className="text-sm font-semibold text-white">Add Column</div>
-                      <div className="mt-3 space-y-2">
-                        <input
-                          value={newStatusName}
-                          onChange={(event) => setNewStatusName(event.target.value)}
-                          placeholder="Status name"
-                          className="w-full rounded-md border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white placeholder:text-[#6d6f78] focus:outline-none"
-                        />
-                        <input
-                          type="color"
-                          value={newStatusColor}
-                          onChange={(event) => setNewStatusColor(event.target.value)}
-                          className="h-10 w-full rounded-md border border-[#3F4147] bg-[#313338] px-2"
-                        />
-                        <button
-                          onClick={createStatus}
-                          className="w-full rounded-md bg-indigo-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
-                        >
-                          Create Status
-                        </button>
-                      </div>
-                    </section>
-                  )}
-                </div>
+                          {canEditProject && (
+                            <div className="mt-4 space-y-2">
+                              <input
+                                value={newTaskTitleByStatus[status.id] || ''}
+                                onChange={(event) =>
+                                  setNewTaskTitleByStatus((prev) => ({ ...prev, [status.id]: event.target.value }))
+                                }
+                                onKeyDown={(e) => e.key === 'Enter' && createTask(status.id)}
+                                placeholder="Quick add task"
+                                className="w-full rounded-md border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white placeholder:text-[#6d6f78] focus:outline-none"
+                              />
+                              <button
+                                onClick={() => createTask(status.id)}
+                                className="w-full rounded-md bg-emerald-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-emerald-600"
+                              >
+                                Add Task
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        <Droppable droppableId={status.id}>
+                          {(provided, snapshot) => (
+                            <div
+                              {...provided.droppableProps}
+                              ref={provided.innerRef}
+                              className={`flex-1 space-y-3 overflow-y-auto p-3 transition-colors ${
+                                snapshot.isDraggingOver ? 'bg-indigo-500/5' : ''
+                              }`}
+                            >
+                              {status.tasks.map((task, index) => (
+                                <Draggable key={task.id} draggableId={task.id} index={index}>
+                                  {(provided, snapshot) => (
+                                    <button
+                                      ref={provided.innerRef}
+                                      {...provided.draggableProps}
+                                      {...provided.dragHandleProps}
+                                      onClick={() => setSelectedTaskId(task.id)}
+                                      className={`w-full rounded-lg border border-[#3F4147] bg-[#2B2D31] p-3 text-left transition shadow-sm ${
+                                        snapshot.isDragging ? 'border-indigo-500 shadow-xl scale-[1.02] z-50' : 'hover:border-indigo-400 hover:bg-[#313338]'
+                                      }`}
+                                    >
+                                      <div className="flex items-start justify-between gap-2">
+                                        <div className="font-semibold text-white">{task.title}</div>
+                                        <span className={`rounded-full px-2 py-1 text-[10px] uppercase ${priorityClasses[task.priority]}`}>
+                                          {task.priority}
+                                        </span>
+                                      </div>
+                                      {task.description && (
+                                        <div className="mt-2 line-clamp-3 text-xs text-[#b5bac1]">{task.description}</div>
+                                      )}
+                                      <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#949ba4]">
+                                        {task.assigneeUsername && (
+                                          <div className="flex items-center gap-1">
+                                            <div className="h-4 w-4 rounded-full bg-indigo-500 flex items-center justify-center text-[8px] text-white font-bold">
+                                              {task.assigneeUsername[0].toUpperCase()}
+                                            </div>
+                                            <span>@{task.assigneeUsername}</span>
+                                          </div>
+                                        )}
+                                        {task.dueAt && <span>Due {new Date(task.dueAt).toLocaleDateString()}</span>}
+                                        {task.comments.length > 0 && <span>{task.comments.length} comments</span>}
+                                      </div>
+                                    </button>
+                                  )}
+                                </Draggable>
+                              ))}
+                              {provided.placeholder}
+                              {!status.tasks.length && !snapshot.isDraggingOver && (
+                                <div className="rounded-lg border border-dashed border-[#3F4147] p-4 text-xs text-[#949ba4] text-center">
+                                  No tasks here.
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </Droppable>
+                      </section>
+                    ))}
+
+                    {canEditProject && (
+                      <section className="w-[260px] shrink-0 rounded-xl border border-dashed border-[#3F4147] bg-[#232428]/70 p-4">
+                        <div className="text-sm font-semibold text-white">Add Column</div>
+                        <div className="mt-3 space-y-2">
+                          <input
+                            value={newStatusName}
+                            onChange={(event) => setNewStatusName(event.target.value)}
+                            placeholder="Status name"
+                            className="w-full rounded-md border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white placeholder:text-[#6d6f78] focus:outline-none"
+                          />
+                          <input
+                            type="color"
+                            value={newStatusColor}
+                            onChange={(event) => setNewStatusColor(event.target.value)}
+                            className="h-10 w-full rounded-md border border-[#3F4147] bg-[#313338] px-2"
+                          />
+                          <button
+                            onClick={createStatus}
+                            className="w-full rounded-md bg-indigo-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+                          >
+                            Create Status
+                          </button>
+                        </div>
+                      </section>
+                    )}
+                  </div>
+                </DragDropContext>
               ) : (
                 <div className="h-full overflow-auto p-4">
                   <div className="overflow-hidden rounded-xl border border-[#1E1F22] bg-[#232428]">
@@ -635,7 +730,13 @@ export default function ProjectsWorkspace({ roomId, username, workspaceReady }: 
                               )}
                             </td>
                             <td className="px-4 py-4 text-sm text-[#b5bac1]">
-                              {currentProject.statuses.find((status) => status.id === task.statusId)?.name || 'Unknown'}
+                              <div className="flex items-center gap-2">
+                                <span 
+                                  className="h-2 w-2 rounded-full" 
+                                  style={{ backgroundColor: currentProject.statuses.find((s) => s.id === task.statusId)?.color || '#5865F2' }} 
+                                />
+                                {currentProject.statuses.find((status) => status.id === task.statusId)?.name || 'Unknown'}
+                              </div>
                             </td>
                             <td className="px-4 py-4 text-sm text-[#b5bac1]">{task.assigneeUsername || 'Unassigned'}</td>
                             <td className="px-4 py-4 text-sm text-[#b5bac1]">

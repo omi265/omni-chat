@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import { getSocket } from '../lib/socket';
+import { DragDropContext, Droppable, Draggable, type DropResult } from '@hello-pangea/dnd';
 
 type NodeType = 'page' | 'project_page' | 'database';
 type PropertyType = 'text' | 'number' | 'checkbox' | 'select' | 'multi_select' | 'date' | 'person' | 'status' | 'relation';
@@ -153,6 +154,7 @@ interface DatabaseDetail extends WorkspaceNode {
   records: DatabaseRecord[];
   views: DatabaseView[];
   backlinks: Backlink[];
+  project?: ProjectDetail | null;
 }
 
 interface TaskDraft {
@@ -438,7 +440,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
   const databaseNodes = useMemo(() => rootNodes.filter((node) => node.nodeType === 'database'), [rootNodes]);
 
   const statusesWithTasks = useMemo(() => {
-    const project = projectPageDetail?.project;
+    const project = databaseDetail?.project || projectPageDetail?.project;
     if (!project) return [];
     return project.statuses.map((status) => ({
       ...status,
@@ -446,16 +448,24 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
         .filter((task) => task.statusId === status.id)
         .sort((a, b) => a.position - b.position || a.createdAt - b.createdAt),
     }));
-  }, [projectPageDetail]);
+  }, [projectPageDetail, databaseDetail]);
 
-  const currentTask = useMemo(
-    () => projectPageDetail?.project?.tasks.find((task) => task.id === selectedTaskId) || null,
-    [projectPageDetail, selectedTaskId]
-  );
+  const currentTask = useMemo(() => {
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    return project?.tasks.find((task) => task.id === selectedTaskId) || null;
+  }, [projectPageDetail, databaseDetail, selectedTaskId]);
 
-  const canEditProject =
-    projectPageDetail?.project?.role === 'project_owner' || projectPageDetail?.project?.role === 'project_editor';
-  const canManageProject = projectPageDetail?.project?.role === 'project_owner';
+  const canEditProject = useMemo(() => {
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    return project?.role === 'project_owner' || project?.role === 'project_editor';
+  }, [projectPageDetail, databaseDetail]);
+
+  const canManageProject = useMemo(() => {
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    return project?.role === 'project_owner';
+  }, [projectPageDetail, databaseDetail]);
+
+  const [databaseViewMode, setDatabaseViewMode] = useState<'board' | 'table'>('board');
 
   const openCreateModal = (kind: 'page' | 'database' | 'project', parentId: string | null = null) => {
     setCreateModal({ kind, parentId });
@@ -613,24 +623,68 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     });
   };
 
+  const [newTaskPriorityByStatus, setNewTaskPriorityByStatus] = useState<Record<string, Priority>>({});
+
   const createTask = (statusId: string) => {
-    if (!projectPageDetail?.project) return;
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    if (!project) return;
     const title = newTaskTitleByStatus[statusId]?.trim();
     if (!title) return;
+    
+    const priority = newTaskPriorityByStatus[statusId] || 'medium';
+    const tempId = 'temp_' + Math.random().toString(36).substring(7);
+    
+    // Optimistic update
+    const newTask = {
+      id: tempId,
+      projectId: project.id,
+      title,
+      description: '',
+      statusId,
+      priority,
+      createdBy: username,
+      assigneeUsername: '',
+      dueAt: 0,
+      position: 1000000, // High position to put it at the end
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      checklist: [],
+      comments: [],
+      attachments: [],
+    };
+
+    if (databaseDetail?.project) {
+      setDatabaseDetail({
+        ...databaseDetail,
+        project: { ...databaseDetail.project, tasks: [...databaseDetail.project.tasks, newTask] }
+      });
+    } else if (projectPageDetail?.project) {
+      setProjectPageDetail({
+        ...projectPageDetail,
+        project: { ...projectPageDetail.project, tasks: [...projectPageDetail.project.tasks, newTask] }
+      });
+    }
+
     socket.emit('task-create', {
-      projectId: projectPageDetail.project.id,
+      projectId: project.id,
       username,
       title,
       statusId,
-      priority: 'medium',
+      priority,
     });
-    setNewTaskTitleByStatus((prev) => ({ ...prev, [statusId]: '' }));
+    
+    setNewTaskTitleByStatus((prev) => {
+      const next = { ...prev };
+      delete next[statusId];
+      return next;
+    });
   };
 
   const createStatus = () => {
-    if (!projectPageDetail?.project || !newStatusName.trim()) return;
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    if (!project || !newStatusName.trim()) return;
     socket.emit('project-status-create', {
-      projectId: projectPageDetail.project.id,
+      projectId: project.id,
       username,
       name: newStatusName,
       color: newStatusColor,
@@ -676,13 +730,14 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
   };
 
   const updateMemberRole = (targetUsername: string, role: string) => {
-    if (!projectPageDetail?.project) return;
+    const project = databaseDetail?.project || projectPageDetail?.project;
+    if (!project) return;
     if (!role) {
-      socket.emit('project-member-remove', { projectId: projectPageDetail.project.id, username, targetUsername });
+      socket.emit('project-member-remove', { projectId: project.id, username, targetUsername });
       return;
     }
     socket.emit('project-member-set', {
-      projectId: projectPageDetail.project.id,
+      projectId: project.id,
       username,
       targetUsername,
       role,
@@ -732,6 +787,82 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
         </div>
       );
     });
+
+  const onDragEnd = (result: DropResult) => {
+    const { destination, source, draggableId } = result;
+    const project = databaseDetail?.project || projectPageDetail?.project;
+
+    if (!destination || !project) return;
+
+    if (destination.droppableId === source.droppableId && destination.index === source.index) {
+      return;
+    }
+
+    const taskId = draggableId;
+    const nextStatusId = destination.droppableId;
+
+    // Find all tasks in the destination column
+    const columnTasks = project.tasks
+      .filter((t) => t.statusId === nextStatusId)
+      .sort((a, b) => a.position - b.position);
+
+    let nextPosition: number;
+
+    if (columnTasks.length === 0) {
+      nextPosition = 1000;
+    } else if (destination.index === 0) {
+      nextPosition = columnTasks[0].position / 2;
+    } else if (destination.index >= columnTasks.length) {
+      nextPosition = columnTasks[columnTasks.length - 1].position + 1000;
+    } else {
+      // If moving within same column and index shifted
+      let adjustedTasks = [...columnTasks];
+      if (source.droppableId === nextStatusId) {
+        const movedTask = adjustedTasks.find(t => t.id === taskId);
+        if (movedTask) {
+          adjustedTasks = adjustedTasks.filter(t => t.id !== taskId);
+        }
+      }
+      
+      if (destination.index === 0) {
+        nextPosition = adjustedTasks[0].position / 2;
+      } else if (destination.index >= adjustedTasks.length) {
+        nextPosition = adjustedTasks[adjustedTasks.length - 1].position + 1000;
+      } else {
+        const prevTask = adjustedTasks[destination.index - 1];
+        const nextTask = adjustedTasks[destination.index];
+        nextPosition = (prevTask.position + nextTask.position) / 2;
+      }
+    }
+
+    socket.emit('task-update', {
+      taskId,
+      username,
+      updates: {
+        statusId: nextStatusId,
+        position: nextPosition,
+      },
+    });
+
+    // Optimistic update
+    if (databaseDetail?.project) {
+      const updatedTasks = databaseDetail.project.tasks.map((t) => {
+        if (t.id === taskId) {
+          return { ...t, statusId: nextStatusId, position: nextPosition };
+        }
+        return t;
+      });
+      setDatabaseDetail({ ...databaseDetail, project: { ...databaseDetail.project, tasks: updatedTasks } });
+    } else if (projectPageDetail?.project) {
+      const updatedTasks = projectPageDetail.project.tasks.map((t) => {
+        if (t.id === taskId) {
+          return { ...t, statusId: nextStatusId, position: nextPosition };
+        }
+        return t;
+      });
+      setProjectPageDetail({ ...projectPageDetail, project: { ...projectPageDetail.project, tasks: updatedTasks } });
+    }
+  };
 
   if (!workspaceReady) {
     return (
@@ -1012,155 +1143,24 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                   </section>
 
                   <section className="rounded-[24px] border border-[#1E1F22] bg-[#2B2D31] p-6 shadow-xl">
-                    <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="flex items-center justify-between gap-4">
                       <div>
-                        <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Project Management</div>
-                        <h2 className="mt-2 text-xl font-semibold text-white">Task board</h2>
+                        <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Quick Actions</div>
+                        <h2 className="mt-2 text-xl font-semibold text-white">Project Tasks</h2>
                         <p className="mt-2 text-sm leading-6 text-[#b5bac1]">
-                          Every project ships with a default kanban board and list view.
+                          The task board has moved to its dedicated "Tasks" page in the sidebar.
                         </p>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => setProjectViewMode('board')}
-                          className={`rounded-full px-3 py-1.5 text-sm font-medium transition ${
-                            projectViewMode === 'board' ? 'bg-indigo-500 text-white' : 'bg-[#232428] text-[#b5bac1]'
-                          }`}
-                        >
-                          Board
-                        </button>
-                        <button
-                          onClick={() => setProjectViewMode('list')}
-                          className={`rounded-full px-3 py-1.5 text-sm font-medium transition ${
-                            projectViewMode === 'list' ? 'bg-indigo-500 text-white' : 'bg-[#232428] text-[#b5bac1]'
-                          }`}
-                        >
-                          List
-                        </button>
-                      </div>
+                      <button
+                        onClick={() => {
+                          const tasksNode = nodes.find(n => n.parentId === projectPageDetail.id && n.nodeType === 'database');
+                          if (tasksNode) openNode(tasksNode);
+                        }}
+                        className="rounded-full bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+                      >
+                        Go to Tasks
+                      </button>
                     </div>
-
-                    {projectViewMode === 'board' ? (
-                      <div className="mt-6 flex gap-4 overflow-x-auto overflow-y-hidden pb-2">
-                        {statusesWithTasks.map((status) => (
-                          <section key={status.id} className="flex h-full min-h-0 w-[310px] shrink-0 flex-col rounded-[22px] border border-[#1E1F22] bg-[#232428] p-4">
-                            <div className="flex items-center gap-2">
-                              <span className="h-3 w-3 rounded-full" style={{ backgroundColor: status.color }} />
-                              <div className="font-semibold text-white">{status.name}</div>
-                              <span className="rounded-full bg-[#1E1F22] px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-[#949ba4]">
-                                {status.tasks.length}
-                              </span>
-                            </div>
-
-                            {canEditProject && (
-                              <div className="mt-4 space-y-2">
-                                <input
-                                  value={newTaskTitleByStatus[status.id] || ''}
-                                  onChange={(event) =>
-                                    setNewTaskTitleByStatus((prev) => ({ ...prev, [status.id]: event.target.value }))
-                                  }
-                                  placeholder="Quick add task"
-                                  className="w-full rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
-                                />
-                                <button
-                                  onClick={() => createTask(status.id)}
-                                  className="w-full rounded-xl bg-emerald-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-emerald-600"
-                                >
-                                  Add task
-                                </button>
-                              </div>
-                            )}
-
-                            <div className="mt-4 flex-1 space-y-3 overflow-y-auto">
-                              {status.tasks.map((task) => (
-                                <button
-                                  key={task.id}
-                                  onClick={() => setSelectedTaskId(task.id)}
-                                  className="w-full rounded-[18px] border border-[#3F4147] bg-[#2B2D31] p-3 text-left transition hover:border-indigo-400 hover:bg-[#313338]"
-                                >
-                                  <div className="flex items-start justify-between gap-3">
-                                    <div className="font-medium text-white">{task.title}</div>
-                                    <span className={`rounded-full px-2 py-1 text-[10px] uppercase ${priorityClasses[task.priority]}`}>
-                                      {task.priority}
-                                    </span>
-                                  </div>
-                                  {task.description && (
-                                    <div className="mt-2 line-clamp-3 text-xs leading-5 text-[#b5bac1]">{task.description}</div>
-                                  )}
-                                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-[#949ba4]">
-                                    {task.assigneeUsername && <span>@{task.assigneeUsername}</span>}
-                                    {task.dueAt && <span>{new Date(task.dueAt).toLocaleDateString()}</span>}
-                                    <span>{task.comments.length} comments</span>
-                                  </div>
-                                </button>
-                              ))}
-                            </div>
-                          </section>
-                        ))}
-
-                        {canEditProject && (
-                          <section className="w-[260px] shrink-0 rounded-[22px] border border-dashed border-[#3F4147] bg-[#232428] p-4">
-                            <div className="font-semibold text-white">New column</div>
-                            <div className="mt-3 space-y-2">
-                              <input
-                                value={newStatusName}
-                                onChange={(event) => setNewStatusName(event.target.value)}
-                                placeholder="Status name"
-                                className="w-full rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
-                              />
-                              <input
-                                type="color"
-                                value={newStatusColor}
-                                onChange={(event) => setNewStatusColor(event.target.value)}
-                                className="h-10 w-full rounded-xl border border-[#3F4147] bg-[#313338] px-2"
-                              />
-                              <button
-                                onClick={createStatus}
-                                className="w-full rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
-                              >
-                                Create column
-                              </button>
-                            </div>
-                          </section>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="mt-6 overflow-hidden rounded-[20px] border border-[#1E1F22]">
-                        <table className="min-w-full divide-y divide-[#ebe3d6] text-left">
-                          <thead className="bg-[#232428] text-xs uppercase tracking-[0.18em] text-[#949ba4]">
-                            <tr>
-                              <th className="px-4 py-3">Task</th>
-                              <th className="px-4 py-3">Status</th>
-                              <th className="px-4 py-3">Assignee</th>
-                              <th className="px-4 py-3">Due</th>
-                              <th className="px-4 py-3">Priority</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-[#1E1F22] bg-[#2B2D31]">
-                            {projectPageDetail.project.tasks.map((task) => (
-                              <tr key={task.id} onClick={() => setSelectedTaskId(task.id)} className="cursor-pointer transition hover:bg-[#313338]">
-                                <td className="px-4 py-4">
-                                  <div className="font-medium text-white">{task.title}</div>
-                                  {task.description && <div className="mt-1 text-xs text-[#b5bac1]">{task.description}</div>}
-                                </td>
-                                <td className="px-4 py-4 text-sm text-[#b5bac1]">
-                                  {projectPageDetail.project?.statuses.find((status) => status.id === task.statusId)?.name || 'Unknown'}
-                                </td>
-                                <td className="px-4 py-4 text-sm text-[#b5bac1]">{task.assigneeUsername || 'Unassigned'}</td>
-                                <td className="px-4 py-4 text-sm text-[#b5bac1]">
-                                  {task.dueAt ? new Date(task.dueAt).toLocaleDateString() : 'No date'}
-                                </td>
-                                <td className="px-4 py-4">
-                                  <span className={`rounded-full px-2 py-1 text-[10px] uppercase ${priorityClasses[task.priority]}`}>
-                                    {task.priority}
-                                  </span>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
                   </section>
                 </div>
 
@@ -1210,14 +1210,17 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
           {databaseDetail && selectedNodeType === 'database' && (
             <section className="mx-auto w-full max-w-6xl px-8 py-10">
               <div className="mb-8">
-                <input
-                  value={databaseDetail.title}
-                  onChange={(event) =>
-                    setDatabaseDetail((prev) => (prev ? { ...prev, title: event.target.value } : prev))
-                  }
-                  onBlur={saveDatabaseMeta}
-                  className="w-full border-none bg-transparent px-0 text-5xl font-semibold tracking-tight text-[#1e1a14] focus:outline-none"
-                />
+                <div className="flex items-center gap-3">
+                  <span className="text-4xl">{databaseDetail.icon || '≣'}</span>
+                  <input
+                    value={databaseDetail.title}
+                    onChange={(event) =>
+                      setDatabaseDetail((prev) => (prev ? { ...prev, title: event.target.value } : prev))
+                    }
+                    onBlur={saveDatabaseMeta}
+                    className="w-full border-none bg-transparent px-0 text-5xl font-semibold tracking-tight text-white focus:outline-none"
+                  />
+                </div>
                 <textarea
                   value={databaseDetail.description}
                   onChange={(event) =>
@@ -1225,128 +1228,353 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                   }
                   onBlur={saveDatabaseMeta}
                   rows={2}
-                  className="mt-3 w-full resize-none border-none bg-transparent px-0 text-base leading-7 text-[#746b61] focus:outline-none"
+                  className="mt-3 w-full resize-none border-none bg-transparent px-0 text-base leading-7 text-[#b5bac1] focus:outline-none"
                   placeholder="Describe this database..."
                 />
               </div>
 
               <div className="rounded-[24px] border border-[#1E1F22] bg-[#2B2D31] p-6 shadow-xl">
-                <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
-                    <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Schema</div>
-                    <div className="mt-2 text-lg font-semibold text-white">Properties and records</div>
+                    <div className="text-[11px] uppercase tracking-[0.2em] text-[#949ba4]">
+                      {databaseDetail.project ? 'Project Task Tracker' : 'Generic Database'}
+                    </div>
+                    <h2 className="mt-1 text-lg font-semibold text-white">
+                      {databaseDetail.project ? 'Kanban Board' : 'Records'}
+                    </h2>
                   </div>
-                  <div className="flex flex-wrap gap-2">
+                  
+                  <div className="flex items-center gap-2">
+                    {databaseDetail.project && (
+                      <div className="mr-4 flex rounded-full bg-[#232428] p-1">
+                        <button
+                          onClick={() => setDatabaseViewMode('board')}
+                          className={`rounded-full px-3 py-1 text-xs font-bold transition ${
+                            databaseViewMode === 'board' ? 'bg-indigo-500 text-white shadow-lg' : 'text-[#949ba4] hover:text-white'
+                          }`}
+                        >
+                          Board
+                        </button>
+                        <button
+                          onClick={() => setDatabaseViewMode('table')}
+                          className={`rounded-full px-3 py-1 text-xs font-bold transition ${
+                            databaseViewMode === 'table' ? 'bg-indigo-500 text-white shadow-lg' : 'text-[#949ba4] hover:text-white'
+                          }`}
+                        >
+                          Table
+                        </button>
+                      </div>
+                    )}
+
+                    {!databaseDetail.project && (
+                      <div className="flex gap-2">
+                        <input
+                          value={newPropertyName}
+                          onChange={(event) => setNewPropertyName(event.target.value)}
+                          placeholder="New property"
+                          className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                        />
+                        <select
+                          value={newPropertyType}
+                          onChange={(event) => setNewPropertyType(event.target.value as PropertyType)}
+                          className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                        >
+                          <option value="text">Text</option>
+                          <option value="number">Number</option>
+                          <option value="checkbox">Checkbox</option>
+                          <option value="select">Select</option>
+                          <option value="multi_select">Multi Select</option>
+                          <option value="date">Date</option>
+                          <option value="person">Person</option>
+                          <option value="status">Status</option>
+                          <option value="relation">Relation</option>
+                        </select>
+                        <button
+                          onClick={addProperty}
+                          className="rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+                        >
+                          Add property
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {databaseDetail.project && databaseViewMode === 'board' ? (
+                  <DragDropContext onDragEnd={onDragEnd}>
+                    <div className="mt-6 flex gap-4 overflow-x-auto overflow-y-hidden pb-4 min-h-[400px]">
+                      {statusesWithTasks.map((status) => (
+                        <section
+                          key={status.id}
+                          className="flex h-full min-h-0 w-[300px] shrink-0 flex-col rounded-2xl border border-[#1E1F22] bg-[#232428] p-4"
+                        >
+                          <div className="mb-4 flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <span className="h-3 w-3 rounded-full" style={{ backgroundColor: status.color }} />
+                              <div className="font-bold text-white text-sm">{status.name}</div>
+                              <span className="rounded-full bg-[#1E1F22] px-2 py-0.5 text-[10px] text-[#949ba4]">
+                                {status.tasks.length}
+                              </span>
+                            </div>
+                          </div>
+
+                          <Droppable droppableId={status.id}>
+                            {(provided, snapshot) => (
+                              <div
+                                {...provided.droppableProps}
+                                ref={provided.innerRef}
+                                className={`flex-1 space-y-3 transition-colors rounded-xl ${
+                                  snapshot.isDraggingOver ? 'bg-indigo-500/5' : ''
+                                }`}
+                              >
+                                {status.tasks.map((task, index) => (
+                                  <Draggable key={task.id} draggableId={task.id} index={index}>
+                                    {(provided, snapshot) => (
+                                      <div
+                                        ref={provided.innerRef}
+                                        {...provided.draggableProps}
+                                        {...provided.dragHandleProps}
+                                        onClick={() => setSelectedTaskId(task.id)}
+                                        className={`w-full rounded-xl border border-[#3F4147] bg-[#2B2D31] p-3 text-left transition shadow-sm cursor-pointer ${
+                                          snapshot.isDragging ? 'border-indigo-500 shadow-xl scale-[1.02] z-50' : 'hover:border-indigo-400 hover:bg-[#313338]'
+                                        }`}
+                                      >
+                                        <div className="flex items-start justify-between gap-2">
+                                          <div className="font-semibold text-white text-sm">{task.title}</div>
+                                          <span className={`rounded-full px-2 py-0.5 text-[9px] uppercase font-bold ${priorityClasses[task.priority]}`}>
+                                            {task.priority}
+                                          </span>
+                                        </div>
+                                        {task.description && (
+                                          <div className="mt-2 line-clamp-2 text-xs text-[#b5bac1] leading-relaxed">{task.description}</div>
+                                        )}
+                                        <div className="mt-3 flex flex-wrap items-center gap-3 text-[10px] text-[#949ba4] font-medium">
+                                          {task.assigneeUsername && (
+                                            <div className="flex items-center gap-1 bg-[#1E1F22] px-1.5 py-0.5 rounded-full">
+                                              <div className="h-3.5 w-3.5 rounded-full bg-indigo-500 flex items-center justify-center text-[7px] text-white font-black">
+                                                {task.assigneeUsername[0].toUpperCase()}
+                                              </div>
+                                              <span>{task.assigneeUsername}</span>
+                                            </div>
+                                          )}
+                                          {task.dueAt && <span>📅 {new Date(task.dueAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span>}
+                                          {task.comments.length > 0 && <span>💬 {task.comments.length}</span>}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </Draggable>
+                                ))}
+                                {provided.placeholder}
+                                {!status.tasks.length && !snapshot.isDraggingOver && (
+                                  <div className="py-8 text-center text-[11px] text-[#6d6f78] border border-dashed border-[#3F4147] rounded-xl uppercase tracking-widest font-bold">
+                                    Empty
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </Droppable>
+
+                          {canEditProject && (
+                            <div className="mt-4 pt-4 border-t border-[#1E1F22] space-y-3">
+                              {newTaskTitleByStatus[status.id] !== undefined ? (
+                                <div className="space-y-3 animate-in fade-in slide-in-from-top-1 duration-200">
+                                  <input
+                                    autoFocus
+                                    value={newTaskTitleByStatus[status.id]}
+                                    onChange={(e) => setNewTaskTitleByStatus(prev => ({ ...prev, [status.id]: e.target.value }))}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') createTask(status.id);
+                                      if (e.key === 'Escape') setNewTaskTitleByStatus(prev => {
+                                        const next = { ...prev };
+                                        delete next[status.id];
+                                        return next;
+                                      });
+                                    }}
+                                    placeholder="Task title..."
+                                    className="w-full rounded-lg border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                                  />
+                                  
+                                  <div className="flex items-center justify-between gap-1 bg-[#1E1F22] p-1 rounded-lg">
+                                    {(['low', 'medium', 'high', 'urgent'] as Priority[]).map((p) => (
+                                      <button
+                                        key={p}
+                                        onClick={() => setNewTaskPriorityByStatus(prev => ({ ...prev, [status.id]: p }))}
+                                        className={`flex-1 py-1 text-[9px] font-black uppercase rounded transition ${
+                                          (newTaskPriorityByStatus[status.id] || 'medium') === p 
+                                          ? priorityClasses[p] + ' shadow-sm' 
+                                          : 'text-[#6d6f78] hover:text-[#b5bac1]'
+                                        }`}
+                                      >
+                                        {p}
+                                      </button>
+                                    ))}
+                                  </div>
+
+                                  <div className="flex gap-2">
+                                    <button
+                                      onClick={() => createTask(status.id)}
+                                      className="flex-1 rounded-lg bg-indigo-500 py-1.5 text-xs font-bold text-white hover:bg-indigo-600 transition shadow-lg"
+                                    >
+                                      Add Task
+                                    </button>
+                                    <button
+                                      onClick={() => setNewTaskTitleByStatus(prev => {
+                                        const next = { ...prev };
+                                        delete next[status.id];
+                                        return next;
+                                      })}
+                                      className="px-3 rounded-lg bg-[#3F4147] text-[#dbdee1] hover:bg-[#4e5058] transition"
+                                    >
+                                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={() => setNewTaskTitleByStatus(prev => ({ ...prev, [status.id]: '' }))}
+                                  className="w-full flex items-center justify-center gap-2 rounded-lg py-2 text-xs font-bold text-[#b5bac1] hover:bg-[#313338] hover:text-white transition group"
+                                >
+                                  <svg className="w-3 h-3 group-hover:scale-125 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M12 5v14M5 12h14" /></svg>
+                                  <span>ADD TASK</span>
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </section>
+                      ))}
+                      
+                      {canEditProject && (
+                        <button
+                          onClick={() => {/* logic to add status */}}
+                          className="w-[200px] shrink-0 rounded-2xl border border-dashed border-[#3F4147] flex flex-col items-center justify-center text-[#b5bac1] hover:bg-[#232428] hover:text-white transition group p-6"
+                        >
+                          <div className="w-10 h-10 rounded-full bg-[#2B2D31] flex items-center justify-center mb-3 group-hover:bg-indigo-500 transition-colors">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 5v14M5 12h14" /></svg>
+                          </div>
+                          <span className="text-xs font-bold uppercase tracking-widest">New Column</span>
+                        </button>
+                      )}
+                    </div>
+                  </DragDropContext>
+                ) : (
+                  <div className="mt-6 overflow-hidden rounded-[20px] border border-[#1E1F22]">
+                    <table className="min-w-full divide-y divide-[#1E1F22] text-left">
+                      <thead className="bg-[#232428] text-xs uppercase tracking-[0.18em] text-[#949ba4]">
+                        <tr>
+                          <th className="px-4 py-3">{databaseDetail.project ? 'Task' : 'Title'}</th>
+                          {databaseDetail.project ? (
+                            <>
+                              <th className="px-4 py-3">Status</th>
+                              <th className="px-4 py-3">Assignee</th>
+                              <th className="px-4 py-3">Due</th>
+                              <th className="px-4 py-3">Priority</th>
+                            </>
+                          ) : (
+                            databaseDetail.properties.map((property) => (
+                              <th key={property.id} className="px-4 py-3">
+                                {property.name}
+                              </th>
+                            ))
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#1E1F22] bg-[#2B2D31]">
+                        {databaseDetail.project ? (
+                          databaseDetail.project.tasks.map((task) => (
+                            <tr key={task.id} onClick={() => setSelectedTaskId(task.id)} className="cursor-pointer transition hover:bg-[#313338]">
+                              <td className="px-4 py-4">
+                                <div className="font-medium text-white">{task.title}</div>
+                                {task.description && <div className="mt-1 text-xs text-[#b5bac1] truncate max-w-xs">{task.description}</div>}
+                              </td>
+                              <td className="px-4 py-4 text-sm text-[#b5bac1]">
+                                <div className="flex items-center gap-2">
+                                  <span className="h-2 w-2 rounded-full" style={{ backgroundColor: databaseDetail.project?.statuses.find(s => s.id === task.statusId)?.color || '#5865F2' }} />
+                                  {databaseDetail.project?.statuses.find((status) => status.id === task.statusId)?.name || 'Unknown'}
+                                </div>
+                              </td>
+                              <td className="px-4 py-4 text-sm text-[#b5bac1]">{task.assigneeUsername || 'Unassigned'}</td>
+                              <td className="px-4 py-4 text-sm text-[#b5bac1]">
+                                {task.dueAt ? new Date(task.dueAt).toLocaleDateString() : 'No date'}
+                              </td>
+                              <td className="px-4 py-4">
+                                <span className={`rounded-full px-2 py-1 text-[10px] uppercase font-bold ${priorityClasses[task.priority]}`}>
+                                  {task.priority}
+                                </span>
+                              </td>
+                            </tr>
+                          ))
+                        ) : (
+                          databaseDetail.records.map((record) => (
+                            <tr key={record.id}>
+                              <td className="px-4 py-3">
+                                <input
+                                  value={record.title}
+                                  onChange={(event) =>
+                                    setDatabaseDetail((prev) =>
+                                      prev
+                                        ? {
+                                            ...prev,
+                                            records: prev.records.map((entry) =>
+                                              entry.id === record.id ? { ...entry, title: event.target.value } : entry
+                                            ),
+                                          }
+                                        : prev
+                                    )
+                                  }
+                                  onBlur={(event) => updateRecord(record.id, event.target.value)}
+                                  className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-white outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+                                />
+                              </td>
+                              {databaseDetail.properties.map((property) => (
+                                <td key={property.id} className="px-4 py-3">
+                                  <input
+                                    value={prettyValue(record.values[property.id])}
+                                    onChange={(event) =>
+                                      setDatabaseDetail((prev) =>
+                                        prev
+                                          ? {
+                                              ...prev,
+                                              records: prev.records.map((entry) =>
+                                                entry.id === record.id
+                                                  ? {
+                                                      ...entry,
+                                                      values: { ...entry.values, [property.id]: event.target.value },
+                                                    }
+                                                  : entry
+                                              ),
+                                            }
+                                          : prev
+                                      )
+                                    }
+                                    onBlur={(event) => updateRecord(record.id, record.title, property.id, event.target.value)}
+                                    className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+                                  />
+                                </td>
+                              ))}
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {!databaseDetail.project && (
+                  <div className="mt-4 flex gap-2">
                     <input
-                      value={newPropertyName}
-                      onChange={(event) => setNewPropertyName(event.target.value)}
-                      placeholder="New property"
-                      className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                      value={newRecordTitle}
+                      onChange={(event) => setNewRecordTitle(event.target.value)}
+                      placeholder="New record title"
+                      className="flex-1 rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
                     />
-                    <select
-                      value={newPropertyType}
-                      onChange={(event) => setNewPropertyType(event.target.value as PropertyType)}
-                      className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
-                    >
-                      <option value="text">Text</option>
-                      <option value="number">Number</option>
-                      <option value="checkbox">Checkbox</option>
-                      <option value="select">Select</option>
-                      <option value="multi_select">Multi Select</option>
-                      <option value="date">Date</option>
-                      <option value="person">Person</option>
-                      <option value="status">Status</option>
-                      <option value="relation">Relation</option>
-                    </select>
                     <button
-                      onClick={addProperty}
-                      className="rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+                      onClick={addRecord}
+                      className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
                     >
-                      Add property
+                      Add record
                     </button>
                   </div>
-                </div>
-
-                <div className="mt-6 overflow-hidden rounded-[20px] border border-[#1E1F22]">
-                  <table className="min-w-full divide-y divide-[#1E1F22] text-left">
-                    <thead className="bg-[#232428] text-xs uppercase tracking-[0.18em] text-[#949ba4]">
-                      <tr>
-                        <th className="px-4 py-3">Title</th>
-                        {databaseDetail.properties.map((property) => (
-                          <th key={property.id} className="px-4 py-3">
-                            {property.name}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#1E1F22] bg-[#2B2D31]">
-                      {databaseDetail.records.map((record) => (
-                        <tr key={record.id}>
-                          <td className="px-4 py-3">
-                            <input
-                              value={record.title}
-                              onChange={(event) =>
-                                setDatabaseDetail((prev) =>
-                                  prev
-                                    ? {
-                                        ...prev,
-                                        records: prev.records.map((entry) =>
-                                          entry.id === record.id ? { ...entry, title: event.target.value } : entry
-                                        ),
-                                      }
-                                    : prev
-                                )
-                              }
-                              onBlur={(event) => updateRecord(record.id, event.target.value)}
-                              className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-white outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
-                            />
-                          </td>
-                          {databaseDetail.properties.map((property) => (
-                            <td key={property.id} className="px-4 py-3">
-                              <input
-                                value={prettyValue(record.values[property.id])}
-                                onChange={(event) =>
-                                  setDatabaseDetail((prev) =>
-                                    prev
-                                      ? {
-                                          ...prev,
-                                          records: prev.records.map((entry) =>
-                                            entry.id === record.id
-                                              ? {
-                                                  ...entry,
-                                                  values: { ...entry.values, [property.id]: event.target.value },
-                                                }
-                                              : entry
-                                          ),
-                                        }
-                                      : prev
-                                  )
-                                }
-                                onBlur={(event) => updateRecord(record.id, record.title, property.id, event.target.value)}
-                                className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
-                              />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="mt-4 flex gap-2">
-                  <input
-                    value={newRecordTitle}
-                    onChange={(event) => setNewRecordTitle(event.target.value)}
-                    placeholder="New record title"
-                    className="flex-1 rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
-                  />
-                  <button
-                    onClick={addRecord}
-                    className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
-                  >
-                    Add record
-                  </button>
-                </div>
+                )}
               </div>
             </section>
           )}

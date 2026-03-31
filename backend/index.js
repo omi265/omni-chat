@@ -3,13 +3,16 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const Database = require('better-sqlite3');
+const Minio = require('minio');
 const path = require('path');
+const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
+  maxHttpBufferSize: 5e7, // 50MB
   cors: {
     origin: (origin, callback) => callback(null, true),
     methods: ['GET', 'POST'],
@@ -20,10 +23,46 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3001;
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const SUPER_ADMIN = process.env.SUPER_ADMIN_USERNAME || 'admin';
+const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'minio';
+const MINIO_PORT = Number(process.env.MINIO_PORT || 9000);
+const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || 'omni';
+const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY || 'omni-secret-key';
+const MINIO_BUCKET = process.env.MINIO_BUCKET || 'omni-thumbs';
+const MINIO_USE_SSL = process.env.MINIO_USE_SSL === 'true';
 
 const db = new Database(path.join(DATA_DIR, 'p2p.db'));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.get('/media/thumb/:fileId', async (req, res) => {
+  try {
+    const file = db
+      .prepare('SELECT thumb_key, thumb_type FROM room_files WHERE id = ? AND thumb_key IS NOT NULL')
+      .get(req.params.fileId);
+
+    if (!file?.thumb_key) {
+      return res.status(404).json({ error: 'Thumbnail not found' });
+    }
+
+    await ensureMinioBucket();
+    const stream = await minioClient.getObject(MINIO_BUCKET, file.thumb_key);
+    res.setHeader('Content-Type', file.thumb_type || 'image/webp');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    stream.on('error', (error) => {
+      console.error('Failed to stream thumbnail', error);
+      if (!res.headersSent) {
+        res.status(500).end('Thumbnail read failed');
+      } else {
+        res.end();
+      }
+    });
+    stream.pipe(res);
+  } catch (error) {
+    console.error('Thumbnail request failed', error);
+    res.status(500).json({ error: 'Thumbnail request failed' });
+  }
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 const randomId = (prefix = '') => `${prefix}${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
@@ -82,7 +121,13 @@ db.exec(`
     size INTEGER NOT NULL,
     data BLOB NOT NULL,
     nonce TEXT NOT NULL,
-    timestamp INTEGER NOT NULL
+    timestamp INTEGER NOT NULL,
+    thumb_key TEXT,
+    thumb_type TEXT,
+    thumb_width INTEGER,
+    thumb_height INTEGER,
+    preview_status TEXT,
+    is_image INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS projects (
@@ -255,9 +300,39 @@ try {
   if (!usersInfo.some((col) => col.name === 'avatarUrl')) {
     db.prepare('ALTER TABLE users ADD COLUMN avatarUrl TEXT').run();
   }
+
+  const roomFilesInfo = db.prepare('PRAGMA table_info(room_files)').all();
+  if (!roomFilesInfo.some((col) => col.name === 'thumb_key')) {
+    db.prepare('ALTER TABLE room_files ADD COLUMN thumb_key TEXT').run();
+  }
+  if (!roomFilesInfo.some((col) => col.name === 'thumb_type')) {
+    db.prepare('ALTER TABLE room_files ADD COLUMN thumb_type TEXT').run();
+  }
+  if (!roomFilesInfo.some((col) => col.name === 'thumb_width')) {
+    db.prepare('ALTER TABLE room_files ADD COLUMN thumb_width INTEGER').run();
+  }
+  if (!roomFilesInfo.some((col) => col.name === 'thumb_height')) {
+    db.prepare('ALTER TABLE room_files ADD COLUMN thumb_height INTEGER').run();
+  }
+  if (!roomFilesInfo.some((col) => col.name === 'preview_status')) {
+    db.prepare("ALTER TABLE room_files ADD COLUMN preview_status TEXT").run();
+  }
+  if (!roomFilesInfo.some((col) => col.name === 'is_image')) {
+    db.prepare('ALTER TABLE room_files ADD COLUMN is_image INTEGER NOT NULL DEFAULT 0').run();
+  }
 } catch (error) {
   console.error('Migration error', error);
 }
+
+const minioClient = new Minio.Client({
+  endPoint: MINIO_ENDPOINT,
+  port: MINIO_PORT,
+  useSSL: MINIO_USE_SSL,
+  accessKey: MINIO_ACCESS_KEY,
+  secretKey: MINIO_SECRET_KEY,
+});
+
+let minioReadyPromise = null;
 
 const onlineUsers = new Map();
 
@@ -715,7 +790,13 @@ const listDatabaseRecords = (nodeId) => {
     });
 };
 
-const getDatabaseDetail = (nodeId) => {
+const getProjectDetailByDatabaseNodeId = (databaseNodeId, username) => {
+  const row = db.prepare('SELECT project_id FROM project_pages WHERE task_database_node_id = ?').get(databaseNodeId);
+  if (!row) return null;
+  return getProjectDetail(row.project_id, username);
+};
+
+const getDatabaseDetail = (nodeId, username) => {
   const node = getWorkspaceNode(nodeId);
   if (!node || node.node_type !== 'database') return null;
 
@@ -736,6 +817,7 @@ const getDatabaseDetail = (nodeId) => {
     views: listDatabaseViews(nodeId),
     records: listDatabaseRecords(nodeId),
     backlinks: listNodeBacklinks(nodeId),
+    project: getProjectDetailByDatabaseNodeId(nodeId, username),
   };
 };
 
@@ -887,6 +969,101 @@ const ensureProjectWorkspaceArtifacts = (roomId) => {
     });
   }
 };
+
+const toBuffer = (payload) => {
+  if (!payload) return Buffer.alloc(0);
+  if (Buffer.isBuffer(payload)) return payload;
+  if (payload instanceof Uint8Array) return Buffer.from(payload);
+  if (payload instanceof ArrayBuffer) return Buffer.from(payload);
+  if (Array.isArray(payload)) return Buffer.from(payload);
+  if (typeof payload === 'object') {
+    if (payload.type === 'Buffer' && Array.isArray(payload.data)) return Buffer.from(payload.data);
+    if (Array.isArray(payload.data)) return Buffer.from(payload.data);
+    if (payload.buffer instanceof ArrayBuffer) {
+      const byteOffset = Number(payload.byteOffset || 0);
+      const byteLength = Number(payload.byteLength || payload.buffer.byteLength);
+      return Buffer.from(payload.buffer, byteOffset, byteLength);
+    }
+    // Final fallback for plain objects
+    try {
+      return Buffer.from(payload);
+    } catch (e) {
+      return Buffer.alloc(0);
+    }
+  }
+  return Buffer.alloc(0);
+};
+
+const ensureMinioBucket = async () => {
+  if (!minioReadyPromise) {
+    minioReadyPromise = (async () => {
+      const exists = await minioClient.bucketExists(MINIO_BUCKET).catch((error) => {
+        console.error('Failed to check MinIO bucket', error);
+        throw error;
+      });
+      if (!exists) {
+        await minioClient.makeBucket(MINIO_BUCKET).catch((error) => {
+          console.error('Failed to create MinIO bucket', error);
+          throw error;
+        });
+      }
+    })().catch((error) => {
+      minioReadyPromise = null;
+      throw error;
+    });
+  }
+  return minioReadyPromise;
+};
+
+const buildThumbnailKey = (roomId, fileId) => `rooms/${encodeURIComponent(roomId)}/thumbs/${fileId}.webp`;
+
+const createThumbnail = async (buffer) => {
+  const image = sharp(buffer).rotate();
+  const metadata = await image.metadata();
+  const resized = await image.resize({ width: 512, height: 512, fit: 'inside', withoutEnlargement: true }).webp({ quality: 82 }).toBuffer({ resolveWithObject: true });
+  return {
+    body: resized.data,
+    type: 'image/webp',
+    width: resized.info.width || metadata.width || null,
+    height: resized.info.height || metadata.height || null,
+  };
+};
+
+const uploadThumbnail = async ({ roomId, fileId, buffer }) => {
+  console.log(`uploadThumbnail starting for ${fileId} in room ${roomId}`);
+  await ensureMinioBucket();
+  const thumb = await createThumbnail(buffer);
+  const key = buildThumbnailKey(roomId, fileId);
+  console.log(`Uploading to MinIO: ${key} (${thumb.body.length} bytes)`);
+  await minioClient.putObject(MINIO_BUCKET, key, thumb.body, thumb.body.length, {
+    'Content-Type': thumb.type,
+    'Cache-Control': 'public, max-age=31536000, immutable',
+  });
+  console.log(`Successfully uploaded ${key} to MinIO`);
+  return {
+    key,
+    type: thumb.type,
+    width: thumb.width,
+    height: thumb.height,
+  };
+};
+
+const serializeRoomFileRow = (file) => ({
+  id: file.id,
+  channelId: file.channel_id,
+  sender: file.sender,
+  name: file.name,
+  type: file.type,
+  size: file.size,
+  nonce: file.nonce,
+  timestamp: file.timestamp,
+  thumbKey: file.thumb_key || null,
+  thumbType: file.thumb_type || null,
+  thumbWidth: file.thumb_width || null,
+  thumbHeight: file.thumb_height || null,
+  previewStatus: file.preview_status || null,
+  isImage: Boolean(file.is_image),
+});
 
 io.on('connection', (socket) => {
   socket.on('register-user', ({ username, publicKey, avatarColor, avatarUrl }) => {
@@ -1076,10 +1253,14 @@ io.on('connection', (socket) => {
 
     const files = db
       .prepare(
-        'SELECT id, channel_id, sender, name, type, size, nonce, timestamp FROM room_files WHERE room_id = ? ORDER BY timestamp ASC LIMIT 100'
+        `SELECT id, channel_id, sender, name, type, size, nonce, timestamp, thumb_key, thumb_type, thumb_width, thumb_height, preview_status, is_image
+         FROM room_files
+         WHERE room_id = ?
+         ORDER BY timestamp ASC
+         LIMIT 100`
       )
       .all(roomId);
-    socket.emit('room-files-bulk', files);
+    socket.emit('room-files-bulk', files.map(serializeRoomFileRow));
   });
 
   socket.on('join-voice', ({ roomId, channelId }) => {
@@ -1132,16 +1313,88 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('room-message', { ...message, channelId });
   });
 
-  socket.on('send-room-file', ({ roomId, channelId, file }) => {
-    const { id, sender, name, type, size, data, nonce, timestamp } = file;
+  socket.on('send-room-file', async ({ roomId, channelId, file }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const { id, sender, name, type, size, data, previewData, nonce, timestamp } = file;
+    console.log(`Received file upload request: ${name} (${size} bytes) from ${sender} in room ${roomId}`);
     try {
-      db.prepare(
-        `INSERT INTO room_files (id, room_id, channel_id, sender, name, type, size, data, nonce, timestamp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, roomId, channelId, sender, name, type, size, data, nonce, timestamp);
-      io.to(roomId).emit('room-file', { ...file, channelId });
+      const blob = toBuffer(data);
+      if (!blob.length) {
+        ack({ ok: false, message: 'Invalid file payload' });
+        return;
+      }
+
+      const typeString = typeof type === 'string' ? type.toLowerCase() : '';
+      const nameString = typeof name === 'string' ? name.toLowerCase() : '';
+      const isImage = typeString.startsWith('image/') || 
+                      nameString.endsWith('.png') || 
+                      nameString.endsWith('.jpg') || 
+                      nameString.endsWith('.jpeg') || 
+                      nameString.endsWith('.webp') || 
+                      nameString.endsWith('.gif');
+      
+      console.log(`Processing file: ${name}, type: ${type}, isImage: ${isImage}`);
+      let thumbKey = null;
+      let thumbType = null;
+      let thumbWidth = null;
+      let thumbHeight = null;
+      let previewStatus = isImage ? 'failed' : null;
+
+      if (isImage) {
+        const previewBuffer = toBuffer(previewData);
+        console.log(`Preview data buffer length: ${previewBuffer.length}`);
+        if (previewBuffer.length) {
+          try {
+            console.log(`Generating thumbnail for ${name}...`);
+            const thumbnail = await uploadThumbnail({ roomId, fileId: id, buffer: previewBuffer });
+            thumbKey = thumbnail.key;
+            thumbType = thumbnail.type;
+            thumbWidth = thumbnail.width;
+            thumbHeight = thumbnail.height;
+            previewStatus = 'ready';
+            console.log(`Thumbnail generated and uploaded: ${thumbKey}`);
+          } catch (error) {
+            console.error(`Failed to generate/upload thumbnail for ${name}`, error);
+            previewStatus = 'failed';
+          }
+        } else {
+          console.warn(`No preview data provided for image ${name}`);
+        }
+      }
+
+      console.log(`Saving ${name} to database...`);
+      try {
+        db.prepare(
+          `INSERT INTO room_files (id, room_id, channel_id, sender, name, type, size, data, nonce, timestamp, thumb_key, thumb_type, thumb_width, thumb_height, preview_status, is_image)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(id, roomId, channelId, sender, name, type, size, blob, nonce, timestamp, thumbKey, thumbType, thumbWidth, thumbHeight, previewStatus, isImage ? 1 : 0);
+        console.log(`Successfully saved ${name} (ID: ${id}) to database.`);
+      } catch (dbError) {
+        console.error(`Database INSERT failed for file ${name}:`, dbError);
+        throw dbError; // Re-throw to be caught by outer catch
+      }
+
+      const roomFilePayload = {
+        id,
+        channelId,
+        sender,
+        name,
+        type,
+        size,
+        nonce,
+        timestamp,
+        thumbKey,
+        thumbType,
+        thumbWidth,
+        thumbHeight,
+        previewStatus,
+        isImage: !!isImage,
+      };
+      io.to(roomId).emit('room-file', roomFilePayload);
+      ack({ ok: true, fileId: id, ...roomFilePayload });
     } catch (error) {
-      console.error('Failed to store/broadcast room file', error);
+      console.error('Failed to store/broadcast room file:', error);
+      ack({ ok: false, message: `Server error: ${error.message || 'Unknown error'}` });
     }
   });
 
@@ -1390,8 +1643,9 @@ io.on('connection', (socket) => {
     if (!isRoomMember(roomId, username)) {
       return emitWorkspaceError(socket, 'You are not a member of this workspace');
     }
-    const database = getDatabaseDetail(nodeId);
+    const database = getDatabaseDetail(nodeId, username);
     if (!database || database.roomId !== roomId) {
+
       return emitWorkspaceError(socket, 'Database not found');
     }
     socket.emit('workspace-database-data', { roomId, database });
