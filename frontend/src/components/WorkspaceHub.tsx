@@ -45,6 +45,7 @@ interface PageDetail extends WorkspaceNode {
   blocks: PageBlock[];
   backlinks: Backlink[];
   childNodes: WorkspaceNode[];
+  ancestors: WorkspaceNode[];
 }
 
 interface WorkspaceMember {
@@ -135,6 +136,7 @@ interface DatabaseProperty {
   id: string;
   name: string;
   propertyType: PropertyType;
+  config?: Record<string, unknown>;
 }
 
 interface DatabaseRecord {
@@ -147,6 +149,7 @@ interface DatabaseView {
   id: string;
   name: string;
   viewType: string;
+  config?: Record<string, unknown>;
 }
 
 interface DatabaseDetail extends WorkspaceNode {
@@ -155,6 +158,7 @@ interface DatabaseDetail extends WorkspaceNode {
   views: DatabaseView[];
   backlinks: Backlink[];
   project?: ProjectDetail | null;
+  ancestors?: WorkspaceNode[];
 }
 
 interface TaskDraft {
@@ -167,8 +171,24 @@ interface TaskDraft {
 }
 
 interface CreateModalState {
-  kind: 'page' | 'database' | 'project' | null;
+  kind: 'page' | 'project' | null;
   parentId: string | null;
+}
+
+interface TrashNodeItem extends WorkspaceNode {
+  archivedAt: number;
+}
+
+interface TrashProjectItem {
+  id: string;
+  roomId: string;
+  title: string;
+  description: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  archivedAt: number;
+  nodeType: 'project_page';
 }
 
 const priorityClasses: Record<Priority, string> = {
@@ -184,6 +204,10 @@ const blockPlaceholders: Record<string, string> = {
   checklist: 'Checklist item',
   quote: 'Callout or quote',
   code: 'Code snippet',
+  callout: 'Helpful note or highlight',
+  bulleted_list: 'Bullet list item',
+  numbered_list: 'Numbered list item',
+  divider: '',
 };
 
 const toDateInputValue = (timestamp: number | null) => {
@@ -198,6 +222,38 @@ const prettyValue = (value: unknown) => {
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
 };
+
+const relationTargetLabel = (value: unknown, nodes: WorkspaceNode[]) => {
+  if (!Array.isArray(value) || value.length === 0) return '';
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object' || !('targetNodeId' in entry)) return '';
+      const targetId = String((entry as { targetNodeId?: unknown }).targetNodeId || '');
+      return nodes.find((node) => node.id === targetId)?.title || targetId;
+    })
+    .filter(Boolean)
+    .join(', ');
+};
+
+const parseChecklistContent = (content: string) => {
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        checked: Boolean((parsed as { checked?: unknown }).checked),
+        text: String((parsed as { text?: unknown }).text || ''),
+      };
+    }
+  } catch {}
+
+  return {
+    checked: false,
+    text: content || '',
+  };
+};
+
+const serializeChecklistContent = (checked: boolean, text: string) =>
+  JSON.stringify({ checked, text });
 
 const toAttachmentBytes = (payload: unknown): Uint8Array => {
   if (payload instanceof Uint8Array) return payload;
@@ -249,6 +305,10 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
   const [projectPageDetail, setProjectPageDetail] = useState<ProjectPageDetail | null>(null);
   const [databaseDetail, setDatabaseDetail] = useState<DatabaseDetail | null>(null);
   const [createModal, setCreateModal] = useState<CreateModalState>({ kind: null, parentId: null });
+  const [showTrash, setShowTrash] = useState(false);
+  const [trashNodes, setTrashNodes] = useState<TrashNodeItem[]>([]);
+  const [trashProjects, setTrashProjects] = useState<TrashProjectItem[]>([]);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [newDescription, setNewDescription] = useState('');
   const [pageParentId, setPageParentId] = useState<string>('standalone');
@@ -265,9 +325,21 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
   const [newStatusName, setNewStatusName] = useState('');
   const [newStatusColor, setNewStatusColor] = useState('#4f7cff');
   const [isManagingMembers, setIsManagingMembers] = useState(false);
+  const [selectedDatabaseViewId, setSelectedDatabaseViewId] = useState<string | null>(null);
+  const [databaseSearch, setDatabaseSearch] = useState('');
+  const [draggingTreeNodeId, setDraggingTreeNodeId] = useState<string | null>(null);
 
   const requestTree = () => socket.emit('workspace-tree-request', { roomId, username });
   const requestMembers = () => socket.emit('workspace-get-members', { roomId, username });
+  const requestTrash = () => socket.emit('workspace-trash-request', { roomId, username });
+
+  const clearSelection = () => {
+    setSelectedNodeId(null);
+    setSelectedNodeType(null);
+    setPageDetail(null);
+    setProjectPageDetail(null);
+    setDatabaseDetail(null);
+  };
 
   const openNode = (node: WorkspaceNode) => {
     setSelectedNodeId(node.id);
@@ -288,6 +360,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
 
     requestTree();
     requestMembers();
+    requestTrash();
 
     const onTree = (payload: { roomId: string; nodes: WorkspaceNode[] }) => {
       if (payload.roomId !== roomId) return;
@@ -297,6 +370,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     const onWorkspaceChanged = (payload: { roomId: string; nodeId?: string | null }) => {
       if (payload.roomId !== roomId) return;
       requestTree();
+      requestTrash();
       if (!selectedNodeId && !payload.nodeId) return;
       const refreshNodeId = payload.nodeId || selectedNodeId;
       if (!refreshNodeId) return;
@@ -342,6 +416,12 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       setWorkspaceMembers(payload.members);
     };
 
+    const onTrash = (payload: { roomId: string; nodes: TrashNodeItem[]; projects: TrashProjectItem[] }) => {
+      if (payload.roomId !== roomId) return;
+      setTrashNodes(payload.nodes);
+      setTrashProjects(payload.projects);
+    };
+
     const onProjectsChanged = (payload: { roomId: string; projectId?: string | null }) => {
       if (payload.roomId !== roomId) return;
       requestTree();
@@ -378,6 +458,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     socket.on('workspace-project-page-data', onProjectPage);
     socket.on('workspace-database-data', onDatabase);
     socket.on('workspace-members-data', onMembers);
+    socket.on('workspace-trash-data', onTrash);
     socket.on('projects-changed', onProjectsChanged);
     socket.on('workspace-error', onWorkspaceError);
     socket.on('project-error', onProjectError);
@@ -390,6 +471,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       socket.off('workspace-project-page-data', onProjectPage);
       socket.off('workspace-database-data', onDatabase);
       socket.off('workspace-members-data', onMembers);
+      socket.off('workspace-trash-data', onTrash);
       socket.off('projects-changed', onProjectsChanged);
       socket.off('workspace-error', onWorkspaceError);
       socket.off('project-error', onProjectError);
@@ -420,6 +502,17 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       dueAt: toDateInputValue(currentTask.dueAt),
     });
   }, [projectPageDetail, selectedTaskId]);
+
+  useEffect(() => {
+    if (!databaseDetail?.views?.length) {
+      setSelectedDatabaseViewId(null);
+      return;
+    }
+    const nextViewId = databaseDetail.views.some((view) => view.id === selectedDatabaseViewId)
+      ? selectedDatabaseViewId
+      : databaseDetail.views[0].id;
+    setSelectedDatabaseViewId(nextViewId);
+  }, [databaseDetail, selectedDatabaseViewId]);
 
   const rootNodes = useMemo(() => nodes.filter((node) => !node.parentId), [nodes]);
   const childMap = useMemo(() => {
@@ -455,6 +548,15 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     const project = databaseDetail?.project || projectPageDetail?.project;
     return project?.tasks.find((task) => task.id === selectedTaskId) || null;
   }, [projectPageDetail, databaseDetail, selectedTaskId]);
+  const activeProject = databaseDetail?.project || projectPageDetail?.project || null;
+  const selectedDatabaseView = useMemo(
+    () => databaseDetail?.views.find((view) => view.id === selectedDatabaseViewId) || databaseDetail?.views[0] || null,
+    [databaseDetail, selectedDatabaseViewId]
+  );
+  const databaseViewConfig = (selectedDatabaseView?.config || {}) as Record<string, unknown>;
+
+  const selectedWorkspaceDetail = pageDetail || projectPageDetail || databaseDetail;
+  const selectedAncestors = selectedWorkspaceDetail?.ancestors || [];
 
   const canEditProject = useMemo(() => {
     const project = databaseDetail?.project || projectPageDetail?.project;
@@ -466,9 +568,54 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     return project?.role === 'project_owner';
   }, [projectPageDetail, databaseDetail]);
 
+  const filteredDatabaseRecords = useMemo(() => {
+    if (!databaseDetail || databaseDetail.project) return [];
+
+    const searchValue = databaseSearch.trim().toLowerCase();
+    const filterPropertyId = String(databaseViewConfig.filterPropertyId || '');
+    const filterValue = String(databaseViewConfig.filterValue || '').trim().toLowerCase();
+    const sortPropertyId = String(databaseViewConfig.sortPropertyId || '');
+    const sortDirection = databaseViewConfig.sortDirection === 'desc' ? 'desc' : 'asc';
+
+    let next = [...databaseDetail.records];
+
+    if (searchValue) {
+      next = next.filter((record) => {
+        if (record.title.toLowerCase().includes(searchValue)) return true;
+        return databaseDetail.properties.some((property) => {
+          const value = property.propertyType === 'relation'
+            ? relationTargetLabel(record.values[property.id], nodes)
+            : prettyValue(record.values[property.id]);
+          return value.toLowerCase().includes(searchValue);
+        });
+      });
+    }
+
+    if (filterPropertyId && filterValue) {
+      next = next.filter((record) => {
+        const property = databaseDetail.properties.find((entry) => entry.id === filterPropertyId);
+        if (!property) return true;
+        const value = property.propertyType === 'relation'
+          ? relationTargetLabel(record.values[property.id], nodes)
+          : prettyValue(record.values[property.id]);
+        return value.toLowerCase().includes(filterValue);
+      });
+    }
+
+    if (sortPropertyId) {
+      next.sort((a, b) => {
+        const left = prettyValue(a.values[sortPropertyId]).toLowerCase();
+        const right = prettyValue(b.values[sortPropertyId]).toLowerCase();
+        return sortDirection === 'desc' ? right.localeCompare(left) : left.localeCompare(right);
+      });
+    }
+
+    return next;
+  }, [databaseDetail, databaseSearch, databaseViewConfig, nodes]);
+
   const [databaseViewMode, setDatabaseViewMode] = useState<'board' | 'table'>('board');
 
-  const openCreateModal = (kind: 'page' | 'database' | 'project', parentId: string | null = null) => {
+  const openCreateModal = (kind: 'page' | 'project', parentId: string | null = null) => {
     setCreateModal({ kind, parentId });
     setNewTitle('');
     setNewDescription('');
@@ -518,7 +665,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
         parentId: createModal.kind === 'page'
           ? (createModal.parentId || (pageParentId === 'standalone' ? null : pageParentId))
           : createModal.parentId,
-        nodeType: createModal.kind,
+        nodeType: 'page',
         title: newTitle,
         description: newDescription,
       },
@@ -535,7 +682,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
           id: response.nodeId,
           roomId,
           parentId: nextParentId,
-          nodeType: createModal.kind as NodeType,
+          nodeType: 'page' as NodeType,
           title: newTitle.trim(),
           description: newDescription.trim(),
           createdBy: username,
@@ -582,8 +729,41 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       nodeId: page.id,
       username,
       blockType,
-      content: '',
+      content: blockType === 'checklist' ? serializeChecklistContent(false, '') : '',
       orderIndex: page.blocks.length,
+    });
+  };
+
+  const deleteBlock = (page: PageDetail | ProjectPageDetail, blockId: string) => {
+    socket.emit('workspace-page-block-delete', {
+      nodeId: page.id,
+      username,
+      blockId,
+    });
+  };
+
+  const reorderBlocks = (page: PageDetail | ProjectPageDetail, sourceIndex: number, destinationIndex: number) => {
+    if (sourceIndex === destinationIndex) return;
+    const nextBlocks = [...page.blocks];
+    const [moved] = nextBlocks.splice(sourceIndex, 1);
+    nextBlocks.splice(destinationIndex, 0, moved);
+
+    const normalizedBlocks = nextBlocks.map((block, index) => ({ ...block, orderIndex: index }));
+    if (page.nodeType === 'project_page') {
+      setProjectPageDetail((prev) => (prev ? { ...prev, blocks: normalizedBlocks } : prev));
+    } else {
+      setPageDetail((prev) => (prev ? { ...prev, blocks: normalizedBlocks } : prev));
+    }
+
+    normalizedBlocks.forEach((block, index) => {
+      socket.emit('workspace-page-block-upsert', {
+        nodeId: page.id,
+        username,
+        blockId: block.id,
+        blockType: block.blockType,
+        content: block.content,
+        orderIndex: index,
+      });
     });
   };
 
@@ -597,6 +777,57 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     });
   };
 
+  const archiveSelectedNode = () => {
+    if (!selectedWorkspaceDetail || selectedWorkspaceDetail.nodeType === 'project_page') return;
+    if (!confirm(`Archive "${selectedWorkspaceDetail.title}"?`)) return;
+    socket.emit(
+      'workspace-node-archive',
+      { nodeId: selectedWorkspaceDetail.id, username },
+      (response: { ok: boolean; message?: string }) => {
+        if (!response.ok) {
+          setError(response.message || 'Failed to archive item');
+          return;
+        }
+        clearSelection();
+      }
+    );
+  };
+
+  const archiveNode = (node: WorkspaceNode) => {
+    if (node.nodeType === 'project_page') return;
+    if (!confirm(`Archive "${node.title}"?`)) return;
+    socket.emit(
+      'workspace-node-archive',
+      { nodeId: node.id, username },
+      (response: { ok: boolean; message?: string }) => {
+        if (!response.ok) {
+          setError(response.message || 'Failed to archive item');
+          return;
+        }
+        if (selectedNodeId === node.id) {
+          clearSelection();
+        }
+      }
+    );
+  };
+
+  const restoreTrashNode = (nodeId: string) => {
+    socket.emit('workspace-node-restore', { nodeId, username }, (response: { ok: boolean; message?: string }) => {
+      if (!response.ok) {
+        setError(response.message || 'Failed to restore item');
+        return;
+      }
+      requestTree();
+      requestTrash();
+    });
+  };
+
+  const restoreTrashProject = (projectId: string) => {
+    socket.emit('project-restore', { projectId, username });
+    requestTree();
+    requestTrash();
+  };
+
   const addProperty = () => {
     if (!databaseDetail || !newPropertyName.trim()) return;
     socket.emit('workspace-database-property-create', {
@@ -607,6 +838,67 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     });
     setNewPropertyName('');
     setNewPropertyType('text');
+  };
+
+  const updateProperty = (propertyId: string, updates: { name?: string; config?: Record<string, unknown> }) => {
+    if (!databaseDetail) return;
+    const property = databaseDetail.properties.find((entry) => entry.id === propertyId);
+    if (!property) return;
+    socket.emit('workspace-database-property-update', {
+      nodeId: databaseDetail.id,
+      propertyId,
+      username,
+      name: updates.name ?? property.name,
+      config: updates.config ?? property.config ?? {},
+    });
+  };
+
+  const deleteProperty = (propertyId: string) => {
+    if (!databaseDetail) return;
+    socket.emit('workspace-database-property-delete', {
+      nodeId: databaseDetail.id,
+      propertyId,
+      username,
+    });
+  };
+
+  const updateDatabaseViewConfig = (partialConfig: Record<string, unknown>) => {
+    if (!databaseDetail || !selectedDatabaseView) return;
+    const nextConfig = { ...(selectedDatabaseView.config || {}), ...partialConfig };
+    socket.emit('workspace-database-view-update', {
+      nodeId: databaseDetail.id,
+      viewId: selectedDatabaseView.id,
+      username,
+      config: nextConfig,
+    });
+    setDatabaseDetail((prev) =>
+      prev
+        ? {
+            ...prev,
+            views: prev.views.map((view) =>
+              view.id === selectedDatabaseView.id ? { ...view, config: nextConfig } : view
+            ),
+          }
+        : prev
+    );
+  };
+
+  const moveTreeNode = (parentId: string | null) => {
+    if (!draggingTreeNodeId) return;
+    socket.emit(
+      'workspace-node-move',
+      {
+        nodeId: draggingTreeNodeId,
+        parentId,
+        username,
+      },
+      (response: { ok: boolean; message?: string }) => {
+        if (!response.ok) {
+          setError(response.message || 'Failed to move item');
+        }
+        setDraggingTreeNodeId(null);
+      }
+    );
   };
 
   const addRecord = () => {
@@ -628,6 +920,84 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       title,
       values: propertyId ? { [propertyId]: value } : undefined,
     });
+  };
+
+  const deleteRecord = (recordId: string) => {
+    if (!databaseDetail) return;
+    socket.emit('workspace-database-record-delete', {
+      nodeId: databaseDetail.id,
+      recordId,
+      username,
+    });
+  };
+
+  const renderGenericPropertyInput = (record: DatabaseRecord, property: DatabaseProperty) => {
+    const value = record.values[property.id];
+
+    if (property.propertyType === 'checkbox') {
+      return (
+        <input
+          type="checkbox"
+          checked={Boolean(value)}
+          onChange={(event) => updateRecord(record.id, record.title, property.id, event.target.checked)}
+          className="h-4 w-4 rounded border-[#3F4147] bg-[#313338]"
+        />
+      );
+    }
+
+    if (property.propertyType === 'relation') {
+      const targetNodeId = String(property.config?.targetNodeId || '');
+      const relationOptions = nodes.filter((node) => node.id !== databaseDetail?.id);
+      const selectedValue = Array.isArray(value) && value[0] && typeof value[0] === 'object' && 'targetNodeId' in value[0]
+        ? String((value[0] as { targetNodeId?: unknown }).targetNodeId || '')
+        : '';
+
+      return (
+        <select
+          value={selectedValue}
+          onChange={(event) => {
+            const nextTarget = nodes.find((node) => node.id === event.target.value);
+            updateRecord(
+              record.id,
+              record.title,
+              property.id,
+              event.target.value
+                ? [{ targetNodeId: event.target.value, targetType: nextTarget?.nodeType || 'page' }]
+                : []
+            );
+          }}
+          disabled={!targetNodeId}
+          className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338] disabled:opacity-50"
+        >
+          <option value="">{targetNodeId ? 'No relation' : 'Choose target in property header'}</option>
+          {relationOptions.map((node) => (
+            <option key={node.id} value={node.id}>
+              {node.title}
+            </option>
+          ))}
+        </select>
+      );
+    }
+
+    if (property.propertyType === 'date') {
+      const dateValue = typeof value === 'string' ? value : '';
+      return (
+        <input
+          type="date"
+          value={dateValue}
+          onChange={(event) => updateRecord(record.id, record.title, property.id, event.target.value)}
+          className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+        />
+      );
+    }
+
+    return (
+      <input
+        value={prettyValue(value)}
+        onChange={(event) => updateRecord(record.id, record.title, property.id, event.target.value)}
+        className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+      />
+    );
   };
 
   const [newTaskPriorityByStatus, setNewTaskPriorityByStatus] = useState<Record<string, Priority>>({});
@@ -768,29 +1138,217 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     event.target.value = '';
   };
 
+  const renderBlockEditor = (page: PageDetail | ProjectPageDetail) => (
+    <DragDropContext
+      onDragEnd={(result) => {
+        if (!result.destination) return;
+        reorderBlocks(page, result.source.index, result.destination.index);
+      }}
+    >
+      <Droppable droppableId={`blocks:${page.id}`}>
+        {(provided) => (
+          <div ref={provided.innerRef} {...provided.droppableProps} className="space-y-4">
+            {page.blocks.map((block, index) => {
+              const checklist = block.blockType === 'checklist' ? parseChecklistContent(block.content) : null;
+
+              return (
+                <Draggable key={block.id} draggableId={`block:${block.id}`} index={index}>
+                  {(provided, snapshot) => (
+                    <div
+                      ref={provided.innerRef}
+                      {...provided.draggableProps}
+                      className={`group rounded-2xl border px-3 py-3 transition ${
+                        snapshot.isDragging ? 'border-indigo-500 bg-[#2B2D31] shadow-2xl' : 'border-transparent hover:border-[#3F4147] hover:bg-[#2B2D31]/60'
+                      }`}
+                    >
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[#949ba4]">
+                          <button
+                            {...provided.dragHandleProps}
+                            className="rounded-md border border-[#3F4147] px-2 py-1 text-[10px] text-[#b5bac1] transition hover:bg-[#313338] hover:text-white"
+                          >
+                            Move
+                          </button>
+                          <span>{block.blockType.replace('_', ' ')}</span>
+                        </div>
+                        <button
+                          onClick={() => deleteBlock(page, block.id)}
+                          className="rounded-md border border-red-500/30 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-red-300 opacity-0 transition hover:bg-red-500/10 group-hover:opacity-100"
+                        >
+                          Delete
+                        </button>
+                      </div>
+
+                      {block.blockType === 'divider' ? (
+                        <button
+                          onClick={() => saveBlock(page, block, '')}
+                          className="w-full py-4"
+                        >
+                          <div className="h-px w-full bg-[#3F4147]" />
+                        </button>
+                      ) : block.blockType === 'checklist' && checklist ? (
+                        <div className="flex items-start gap-3">
+                          <input
+                            type="checkbox"
+                            checked={checklist.checked}
+                            onChange={(event) => saveBlock(page, block, serializeChecklistContent(event.target.checked, checklist.text))}
+                            className="mt-1 h-4 w-4 rounded border-[#3F4147] bg-[#1E1F22]"
+                          />
+                          <textarea
+                            value={checklist.text}
+                            onChange={(event) =>
+                              page.nodeType === 'project_page'
+                                ? setProjectPageDetail((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          blocks: prev.blocks.map((entry) =>
+                                            entry.id === block.id
+                                              ? { ...entry, content: serializeChecklistContent(checklist.checked, event.target.value) }
+                                              : entry
+                                          ),
+                                        }
+                                      : prev
+                                  )
+                                : setPageDetail((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          blocks: prev.blocks.map((entry) =>
+                                            entry.id === block.id
+                                              ? { ...entry, content: serializeChecklistContent(checklist.checked, event.target.value) }
+                                              : entry
+                                          ),
+                                        }
+                                      : prev
+                                  )
+                            }
+                            onBlur={(event) => saveBlock(page, block, serializeChecklistContent(checklist.checked, event.target.value))}
+                            rows={2}
+                            placeholder={blockPlaceholders[block.blockType]}
+                            className="w-full resize-none rounded-xl border border-transparent bg-transparent px-0 py-0 text-base leading-7 text-[#dbdee1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338] focus:px-3 focus:py-2"
+                          />
+                        </div>
+                      ) : (
+                        <textarea
+                          value={block.content}
+                          onChange={(event) =>
+                            page.nodeType === 'project_page'
+                              ? setProjectPageDetail((prev) =>
+                                  prev
+                                    ? {
+                                        ...prev,
+                                        blocks: prev.blocks.map((entry) =>
+                                          entry.id === block.id ? { ...entry, content: event.target.value } : entry
+                                        ),
+                                      }
+                                    : prev
+                                )
+                              : setPageDetail((prev) =>
+                                  prev
+                                    ? {
+                                        ...prev,
+                                        blocks: prev.blocks.map((entry) =>
+                                          entry.id === block.id ? { ...entry, content: event.target.value } : entry
+                                        ),
+                                      }
+                                    : prev
+                                )
+                          }
+                          onBlur={(event) => saveBlock(page, block, event.target.value)}
+                          rows={block.blockType === 'heading' ? 2 : block.blockType === 'code' ? 6 : 4}
+                          placeholder={blockPlaceholders[block.blockType] || 'Write...'}
+                          className={`w-full resize-none rounded-xl border border-transparent bg-transparent px-3 py-2 outline-none transition focus:border-[#3F4147] focus:bg-[#313338] ${
+                            block.blockType === 'heading'
+                              ? 'text-3xl font-semibold tracking-tight text-white'
+                              : block.blockType === 'quote'
+                                ? 'border-l-4 border-[#6b7280] italic text-[#d1d5db]'
+                                : block.blockType === 'code'
+                                  ? 'bg-[#1E1F22] font-mono text-sm text-emerald-200'
+                                  : block.blockType === 'callout'
+                                    ? 'bg-amber-500/10 text-amber-100'
+                                    : block.blockType === 'bulleted_list'
+                                      ? 'text-[#dbdee1]'
+                                      : block.blockType === 'numbered_list'
+                                        ? 'text-[#dbdee1]'
+                                        : 'text-base leading-7 text-[#dbdee1]'
+                          }`}
+                        />
+                      )}
+                    </div>
+                  )}
+                </Draggable>
+              );
+            })}
+            {provided.placeholder}
+          </div>
+        )}
+      </Droppable>
+    </DragDropContext>
+  );
+
   const renderTree = (items: WorkspaceNode[], depth = 0): React.ReactNode =>
     items.map((node) => {
       const children = childMap.get(node.id) || [];
       return (
         <div key={node.id}>
-          <button
-            onClick={() => openNode(node)}
-            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition ${
+          <div
+            draggable={node.nodeType !== 'project_page'}
+            onDragStart={() => setDraggingTreeNodeId(node.id)}
+            onDragEnd={() => setDraggingTreeNodeId(null)}
+            onDragOver={(event) => {
+              if (node.nodeType === 'page' || node.nodeType === 'project_page') event.preventDefault();
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              if (node.nodeType === 'page' || node.nodeType === 'project_page') {
+                moveTreeNode(node.id);
+              }
+            }}
+            className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition ${
               selectedNodeId === node.id
                 ? 'bg-[#3F4147] text-white shadow-sm'
                 : 'text-[#b5bac1] hover:bg-[#313338] hover:text-white'
             }`}
-            style={{ paddingLeft: `${depth * 14 + 8}px` }}
+            style={{ paddingLeft: `${isSidebarCollapsed ? 8 : depth * 14 + 8}px` }}
+            title={node.title}
           >
-            <span className="w-4 text-center text-[#949ba4]">{node.icon || iconForNode(node.nodeType)}</span>
-            <span className="truncate">{node.title}</span>
-            {node.nodeType === 'project_page' && (
-              <span className="ml-auto rounded-full bg-[#1E1F22] px-1.5 py-0.5 text-[10px] uppercase tracking-[0.14em] text-[#949ba4]">
+            <button onClick={() => openNode(node)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+              <span className="w-4 text-center text-[#949ba4]">{node.icon || iconForNode(node.nodeType)}</span>
+              {!isSidebarCollapsed && <span className="truncate">{node.title}</span>}
+            </button>
+            {node.nodeType === 'project_page' && !isSidebarCollapsed && (
+              <span className="rounded-full bg-[#1E1F22] px-1.5 py-0.5 text-[10px] uppercase tracking-[0.14em] text-[#949ba4]">
                 Project
               </span>
             )}
-          </button>
-          {children.length > 0 && <div className="mt-0.5 space-y-0.5">{renderTree(children, depth + 1)}</div>}
+            {node.nodeType !== 'project_page' && !isSidebarCollapsed && (
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  archiveNode(node);
+                }}
+                className="rounded-md border border-red-500/30 px-2 py-1 text-[10px] text-red-300 opacity-0 transition hover:bg-red-500/10 group-hover:opacity-100"
+                title="Archive"
+              >
+                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 7h12m-9 0V5a1 1 0 011-1h4a1 1 0 011 1v2m-8 0l1 12a1 1 0 001 1h6a1 1 0 001-1l1-12" /></svg>
+              </button>
+            )}
+            {node.nodeType === 'project_page' && canManageProject && selectedNodeId === node.id && projectPageDetail?.project && !isSidebarCollapsed && (
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (!projectPageDetail?.project) return;
+                  socket.emit('project-archive', { projectId: projectPageDetail.project.id, username });
+                }}
+                className="rounded-md border border-red-500/30 px-2 py-1 text-[10px] text-red-300 opacity-0 transition hover:bg-red-500/10 group-hover:opacity-100"
+                title="Archive Project"
+              >
+                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 7h12m-9 0V5a1 1 0 011-1h4a1 1 0 011 1v2m-8 0l1 12a1 1 0 001 1h6a1 1 0 001-1l1-12" /></svg>
+              </button>
+            )}
+          </div>
+          {children.length > 0 && !isSidebarCollapsed && <div className="mt-0.5 space-y-0.5">{renderTree(children, depth + 1)}</div>}
         </div>
       );
     });
@@ -883,28 +1441,45 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
 
   return (
     <div className="flex h-full min-h-0 bg-[#313338] text-gray-200">
-      <aside className="flex w-[300px] shrink-0 flex-col border-r border-[#1E1F22] bg-[#232428]">
+      <aside className={`flex shrink-0 flex-col border-r border-[#1E1F22] bg-[#232428] transition-[width] duration-200 ${isSidebarCollapsed ? 'w-[72px]' : 'w-[300px]'}`}>
         <div className="border-b border-[#1E1F22] px-4 py-3">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#949ba4]">Workspace</div>
-              <div className="mt-1 text-lg font-semibold text-white">Omni</div>
+              {isSidebarCollapsed ? (
+                <div className="text-lg font-semibold text-white">O</div>
+              ) : (
+                <>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#949ba4]">Workspace</div>
+                  <div className="mt-1 text-lg font-semibold text-white">Omni</div>
+                </>
+              )}
             </div>
             <div className="flex items-center gap-1">
+              <IconButton title={isSidebarCollapsed ? 'Expand Sidebar' : 'Collapse Sidebar'} onClick={() => setIsSidebarCollapsed((prev) => !prev)}>
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  {isSidebarCollapsed ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M9 5l7 7-7 7" />
+                  ) : (
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M15 5l-7 7 7 7" />
+                  )}
+                </svg>
+              </IconButton>
+              <IconButton title="Trash" onClick={() => { requestTrash(); setShowTrash(true); }}>
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M6 7h12m-9 0V5a1 1 0 011-1h4a1 1 0 011 1v2m-8 0l1 12a1 1 0 001 1h6a1 1 0 001-1l1-12" /></svg>
+              </IconButton>
               <IconButton title="New Page" onClick={() => openCreateModal('page')}>
                 <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M12 5v14M5 12h14" /></svg>
               </IconButton>
               <IconButton title="New Project" onClick={() => openCreateModal('project')}>
                 <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M4 7h16M7 4v6m10-6v6M5 11h14v8H5z" /></svg>
               </IconButton>
-              <IconButton title="New Database" onClick={() => openCreateModal('database')}>
-                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3" strokeWidth="1.8" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6m-14 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" /></svg>
-              </IconButton>
             </div>
           </div>
-          <div className="mt-3 rounded-lg border border-[#1E1F22] bg-[#2B2D31] px-3 py-2 text-xs leading-relaxed text-[#b5bac1]">
-            Projects, pages, and databases now live in one tree. Each project opens as a page with its task board embedded below.
-          </div>
+          {!isSidebarCollapsed && (
+            <div className="mt-3 rounded-lg border border-[#1E1F22] bg-[#2B2D31] px-3 py-2 text-xs leading-relaxed text-[#b5bac1]">
+              Projects and pages now live in one tree. Each project opens as a page with its task database embedded below.
+            </div>
+          )}
         </div>
 
         {error && (
@@ -913,27 +1488,38 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto px-3 py-4">
+        <div className={`flex-1 overflow-y-auto ${isSidebarCollapsed ? 'px-2 py-4' : 'px-3 py-4'}`}>
           <div className="space-y-6">
             <div>
-              <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Projects</div>
+              {!isSidebarCollapsed && <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Projects</div>}
               <div className="space-y-1">{renderTree(projectNodes)}</div>
-              {!projectNodes.length && <div className="px-2 text-sm text-[#949ba4]">No projects yet.</div>}
+              {!projectNodes.length && !isSidebarCollapsed && <div className="px-2 text-sm text-[#949ba4]">No projects yet.</div>}
             </div>
 
             <div>
-              <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Pages</div>
-              <div className="space-y-1">{renderTree(pageNodes)}</div>
-              {!pageNodes.length && <div className="px-2 text-sm text-[#949ba4]">No standalone pages.</div>}
+              {!isSidebarCollapsed && <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Pages</div>}
+              <div
+                className="space-y-1 rounded-xl border border-dashed border-transparent p-1 transition hover:border-[#3F4147]"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  moveTreeNode(null);
+                }}
+              >
+                {renderTree(pageNodes)}
+              </div>
+              {!pageNodes.length && !isSidebarCollapsed && <div className="px-2 text-sm text-[#949ba4]">No standalone pages.</div>}
             </div>
 
-            <div>
-              <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Databases</div>
-              <div className="space-y-1">{renderTree(databaseNodes)}</div>
-              {!databaseNodes.length && <div className="px-2 text-sm text-[#949ba4]">No standalone databases.</div>}
-            </div>
+            {!isSidebarCollapsed && databaseNodes.length > 0 && (
+              <div>
+                <div className="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#949ba4]">Project Databases</div>
+                <div className="space-y-1">{renderTree(databaseNodes)}</div>
+              </div>
+            )}
           </div>
         </div>
+
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col bg-[#313338]">
@@ -950,16 +1536,27 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                       ? 'Document page'
                       : 'Select a page, database, or project'}
               </div>
+              {selectedWorkspaceDetail ? (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[#949ba4]">
+                  <button onClick={clearSelection} className="transition hover:text-white">Workspace</button>
+                  {selectedAncestors.map((ancestor) => (
+                    <div key={ancestor.id} className="flex items-center gap-2">
+                      <span>/</span>
+                      <button onClick={() => openNode(ancestor)} className="transition hover:text-white">
+                        {ancestor.title}
+                      </button>
+                    </div>
+                  ))}
+                  <div className="flex items-center gap-2 text-white">
+                    <span>/</span>
+                    <span>{selectedWorkspaceDetail.title}</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-2 text-xs text-[#72757d]">Pages, project homes, and databases now share one connected tree.</div>
+              )}
             </div>
             <div className="flex items-center gap-1">
-              {selectedNodeType === 'project_page' && selectedNodeId && (
-                <IconButton title="New Subpage" onClick={() => openCreateModal('page', selectedNodeId)}>
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M8 7h8M8 12h8M8 17h5M5 4h14a1 1 0 011 1v14a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1z" /></svg>
-                </IconButton>
-              )}
-              <IconButton title="Refresh" onClick={() => { requestTree(); requestMembers(); selectedNodeId && selectedNodeType && openNode(nodes.find((node) => node.id === selectedNodeId) || { id: selectedNodeId, roomId, parentId: null, nodeType: selectedNodeType, title: '', description: '', createdBy: username, createdAt: 0, updatedAt: 0 }); }}>
-                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M4 4v6h6M20 20v-6h-6M20 9a8 8 0 00-14.85-3M4 15a8 8 0 0014.85 3" /></svg>
-              </IconButton>
             </div>
           </div>
         </div>
@@ -1010,35 +1607,10 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                 />
               </div>
 
-              <div className="space-y-4">
-                {pageDetail.blocks.map((block) => (
-                  <textarea
-                    key={block.id}
-                    value={block.content}
-                    onChange={(event) =>
-                      setPageDetail((prev) =>
-                        prev
-                          ? {
-                              ...prev,
-                              blocks: prev.blocks.map((entry) =>
-                                entry.id === block.id ? { ...entry, content: event.target.value } : entry
-                              ),
-                            }
-                          : prev
-                      )
-                    }
-                    onBlur={(event) => saveBlock(pageDetail, block, event.target.value)}
-                    rows={block.blockType === 'heading' ? 2 : 4}
-                    className={`w-full resize-none rounded-2xl border border-transparent bg-transparent px-4 py-3 transition focus:border-[#3F4147] focus:bg-[#2B2D31] focus:outline-none ${
-                      block.blockType === 'heading' ? 'text-2xl font-semibold text-white' : 'text-base leading-7 text-[#dbdee1]'
-                    }`}
-                    placeholder={blockPlaceholders[block.blockType] || 'Write...'}
-                  />
-                ))}
-              </div>
+              {renderBlockEditor(pageDetail)}
 
               <div className="mt-8 flex flex-wrap gap-2">
-                {['paragraph', 'heading', 'checklist', 'quote', 'code'].map((blockType) => (
+                {['paragraph', 'heading', 'quote', 'checklist', 'code', 'callout', 'bulleted_list', 'numbered_list', 'divider'].map((blockType) => (
                   <button
                     key={blockType}
                     onClick={() => addBlock(pageDetail, blockType)}
@@ -1048,6 +1620,45 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                   </button>
                 ))}
               </div>
+
+              {(pageDetail.childNodes.length > 0 || pageDetail.backlinks.length > 0) && (
+                <div className="mt-10 grid gap-4 lg:grid-cols-2">
+                  <section className="rounded-[22px] border border-[#1E1F22] bg-[#2B2D31] p-5">
+                    <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Subpages</div>
+                    <div className="mt-4 space-y-2">
+                      {pageDetail.childNodes.map((child) => (
+                        <button
+                          key={child.id}
+                          onClick={() => openNode(child)}
+                          className="flex w-full items-center gap-2 rounded-xl bg-[#232428] px-3 py-2 text-left text-sm text-[#dbdee1] transition hover:bg-[#313338]"
+                        >
+                          <span className="w-4 text-center text-[#949ba4]">{child.icon || iconForNode(child.nodeType)}</span>
+                          <span className="truncate">{child.title}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className="rounded-[22px] border border-[#1E1F22] bg-[#2B2D31] p-5">
+                    <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Linked References</div>
+                    <div className="mt-4 space-y-2">
+                      {pageDetail.backlinks.map((backlink, index) => {
+                        const sourceNode = nodes.find((node) => node.id === backlink.sourceNodeId);
+                        return (
+                          <button
+                            key={`${backlink.sourceNodeId}-${index}`}
+                            onClick={() => sourceNode && openNode(sourceNode)}
+                            className="flex w-full items-center justify-between rounded-xl bg-[#232428] px-3 py-2 text-left text-sm text-[#dbdee1] transition hover:bg-[#313338]"
+                          >
+                            <span className="truncate">{sourceNode?.title || backlink.sourceNodeId}</span>
+                            <span className="text-[10px] uppercase tracking-[0.18em] text-[#949ba4]">{backlink.targetType}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </div>
+              )}
             </section>
           )}
 
@@ -1111,33 +1722,12 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                       </div>
                     </div>
 
-                    <div className="mt-6 space-y-3">
-                      {projectPageDetail.blocks.map((block) => (
-                        <textarea
-                          key={block.id}
-                          value={block.content}
-                          onChange={(event) =>
-                            setProjectPageDetail((prev) =>
-                              prev
-                                ? {
-                                    ...prev,
-                                    blocks: prev.blocks.map((entry) =>
-                                      entry.id === block.id ? { ...entry, content: event.target.value } : entry
-                                    ),
-                                  }
-                                : prev
-                            )
-                          }
-                          onBlur={(event) => saveBlock(projectPageDetail, block, event.target.value)}
-                          rows={block.blockType === 'heading' ? 2 : 4}
-                          className="w-full resize-none rounded-2xl border border-transparent bg-[#232428] px-4 py-3 text-base leading-7 text-[#dbdee1] transition focus:border-[#3F4147] focus:bg-[#313338] focus:outline-none"
-                          placeholder={blockPlaceholders[block.blockType] || 'Write...'}
-                        />
-                      ))}
+                    <div className="mt-6">
+                      {renderBlockEditor(projectPageDetail)}
                     </div>
 
                     <div className="mt-5 flex flex-wrap gap-2">
-                      {['paragraph', 'heading', 'checklist', 'quote'].map((blockType) => (
+                      {['paragraph', 'heading', 'quote', 'checklist', 'code', 'callout', 'bulleted_list', 'numbered_list', 'divider'].map((blockType) => (
                         <button
                           key={blockType}
                           onClick={() => addBlock(projectPageDetail, blockType)}
@@ -1274,7 +1864,20 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                     )}
 
                     {!databaseDetail.project && (
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
+                        {databaseDetail.views.length > 0 && (
+                          <select
+                            value={selectedDatabaseViewId || ''}
+                            onChange={(event) => setSelectedDatabaseViewId(event.target.value)}
+                            className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                          >
+                            {databaseDetail.views.map((view) => (
+                              <option key={view.id} value={view.id}>
+                                {view.name}
+                              </option>
+                            ))}
+                          </select>
+                        )}
                         <input
                           value={newPropertyName}
                           onChange={(event) => setNewPropertyName(event.target.value)}
@@ -1306,6 +1909,57 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                     )}
                   </div>
                 </div>
+
+                {!databaseDetail.project && (
+                  <div className="mt-5 grid gap-3 rounded-2xl border border-[#1E1F22] bg-[#232428] p-4 lg:grid-cols-4">
+                    <input
+                      value={databaseSearch}
+                      onChange={(event) => setDatabaseSearch(event.target.value)}
+                      placeholder="Search records"
+                      className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                    />
+                    <select
+                      value={String(databaseViewConfig.filterPropertyId || '')}
+                      onChange={(event) => updateDatabaseViewConfig({ filterPropertyId: event.target.value })}
+                      className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                    >
+                      <option value="">Filter property</option>
+                      {databaseDetail.properties.map((property) => (
+                        <option key={property.id} value={property.id}>
+                          {property.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      value={String(databaseViewConfig.filterValue || '')}
+                      onChange={(event) => updateDatabaseViewConfig({ filterValue: event.target.value })}
+                      placeholder="Filter contains"
+                      className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <select
+                        value={String(databaseViewConfig.sortPropertyId || '')}
+                        onChange={(event) => updateDatabaseViewConfig({ sortPropertyId: event.target.value })}
+                        className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                      >
+                        <option value="">Sort by</option>
+                        {databaseDetail.properties.map((property) => (
+                          <option key={property.id} value={property.id}>
+                            {property.name}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={String(databaseViewConfig.sortDirection || 'asc')}
+                        onChange={(event) => updateDatabaseViewConfig({ sortDirection: event.target.value })}
+                        className="rounded-xl border border-[#3F4147] bg-[#313338] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-500"
+                      >
+                        <option value="asc">A-Z</option>
+                        <option value="desc">Z-A</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
 
                 {databaseDetail.project && databaseViewMode === 'board' ? (
                   <DragDropContext onDragEnd={onDragEnd}>
@@ -1479,7 +2133,51 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                           ) : (
                             databaseDetail.properties.map((property) => (
                               <th key={property.id} className="px-4 py-3">
-                                {property.name}
+                                <div className="space-y-2">
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      value={property.name}
+                                      onChange={(event) =>
+                                        setDatabaseDetail((prev) =>
+                                          prev
+                                            ? {
+                                                ...prev,
+                                                properties: prev.properties.map((entry) =>
+                                                  entry.id === property.id ? { ...entry, name: event.target.value } : entry
+                                                ),
+                                              }
+                                            : prev
+                                        )
+                                      }
+                                      onBlur={(event) => updateProperty(property.id, { name: event.target.value })}
+                                      className="w-full rounded-md border border-transparent bg-transparent px-2 py-1 text-[11px] uppercase tracking-[0.18em] text-[#949ba4] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+                                    />
+                                    <button
+                                      onClick={() => deleteProperty(property.id)}
+                                      className="rounded-md border border-red-500/30 px-2 py-1 text-[10px] text-red-300 transition hover:bg-red-500/10"
+                                    >
+                                      x
+                                    </button>
+                                  </div>
+                                  {property.propertyType === 'relation' && (
+                                    <select
+                                      value={String(property.config?.targetNodeId || '')}
+                                      onChange={(event) =>
+                                        updateProperty(property.id, {
+                                          config: { ...(property.config || {}), targetNodeId: event.target.value },
+                                        })
+                                      }
+                                      className="w-full rounded-md border border-[#3F4147] bg-[#313338] px-2 py-1 text-[10px] text-[#b5bac1] outline-none transition focus:border-indigo-500"
+                                    >
+                                      <option value="">Target object</option>
+                                      {nodes.filter((node) => node.id !== databaseDetail.id).map((node) => (
+                                        <option key={node.id} value={node.id}>
+                                          {node.title}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  )}
+                                </div>
                               </th>
                             ))
                           )}
@@ -1511,55 +2209,53 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                             </tr>
                           ))
                         ) : (
-                          databaseDetail.records.map((record) => (
-                            <tr key={record.id}>
-                              <td className="px-4 py-3">
-                                <input
-                                  value={record.title}
-                                  onChange={(event) =>
-                                    setDatabaseDetail((prev) =>
-                                      prev
-                                        ? {
-                                            ...prev,
-                                            records: prev.records.map((entry) =>
-                                              entry.id === record.id ? { ...entry, title: event.target.value } : entry
-                                            ),
-                                          }
-                                        : prev
-                                    )
-                                  }
-                                  onBlur={(event) => updateRecord(record.id, event.target.value)}
-                                  className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-white outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
-                                />
-                              </td>
-                              {databaseDetail.properties.map((property) => (
-                                <td key={property.id} className="px-4 py-3">
-                                  <input
-                                    value={prettyValue(record.values[property.id])}
-                                    onChange={(event) =>
-                                      setDatabaseDetail((prev) =>
-                                        prev
-                                          ? {
-                                              ...prev,
-                                              records: prev.records.map((entry) =>
-                                                entry.id === record.id
-                                                  ? {
-                                                      ...entry,
-                                                      values: { ...entry.values, [property.id]: event.target.value },
-                                                    }
-                                                  : entry
-                                              ),
-                                            }
-                                          : prev
-                                      )
-                                    }
-                                    onBlur={(event) => updateRecord(record.id, record.title, property.id, event.target.value)}
-                                    className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-[#b5bac1] outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
-                                  />
+                          filteredDatabaseRecords.length > 0 ? (
+                            filteredDatabaseRecords.map((record) => (
+                              <tr key={record.id}>
+                                <td className="px-4 py-3">
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      value={record.title}
+                                      onChange={(event) =>
+                                        setDatabaseDetail((prev) =>
+                                          prev
+                                            ? {
+                                                ...prev,
+                                                records: prev.records.map((entry) =>
+                                                  entry.id === record.id ? { ...entry, title: event.target.value } : entry
+                                                ),
+                                              }
+                                            : prev
+                                        )
+                                      }
+                                      onBlur={(event) => updateRecord(record.id, event.target.value)}
+                                      className="w-full rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm text-white outline-none transition focus:border-[#3F4147] focus:bg-[#313338]"
+                                    />
+                                    <button
+                                      onClick={() => deleteRecord(record.id)}
+                                      className="rounded-md border border-red-500/30 px-2 py-1 text-[10px] text-red-300 transition hover:bg-red-500/10"
+                                    >
+                                      x
+                                    </button>
+                                  </div>
                                 </td>
-                              ))}
+                                {databaseDetail.properties.map((property) => (
+                                  <td key={property.id} className="px-4 py-3">
+                                    {renderGenericPropertyInput(record, property)}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td
+                                colSpan={Math.max(1, databaseDetail.properties.length + 1)}
+                                className="px-4 py-10 text-center text-sm text-[#949ba4]"
+                              >
+                                No records match this view.
+                              </td>
                             </tr>
-                          ))
+                          )
                         )}
                       </tbody>
                     </table>
@@ -1582,24 +2278,110 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                     </button>
                   </div>
                 )}
+
+                {databaseDetail.backlinks.length > 0 && (
+                  <section className="mt-6 rounded-[22px] border border-[#1E1F22] bg-[#232428] p-5">
+                    <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Linked References</div>
+                    <div className="mt-4 space-y-2">
+                      {databaseDetail.backlinks.map((backlink, index) => {
+                        const sourceNode = nodes.find((node) => node.id === backlink.sourceNodeId);
+                        return (
+                          <button
+                            key={`${backlink.sourceNodeId}-${index}`}
+                            onClick={() => sourceNode && openNode(sourceNode)}
+                            className="flex w-full items-center justify-between rounded-xl bg-[#313338] px-3 py-2 text-left text-sm text-[#dbdee1] transition hover:bg-[#3F4147]"
+                          >
+                            <span className="truncate">{sourceNode?.title || backlink.sourceNodeId}</span>
+                            <span className="text-[10px] uppercase tracking-[0.18em] text-[#949ba4]">{backlink.targetType}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
               </div>
             </section>
           )}
         </div>
       </main>
 
+      {showTrash && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="flex h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-[28px] border border-[#1E1F22] bg-[#313338] shadow-2xl">
+            <div className="border-b border-[#1E1F22] px-6 py-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-[#949ba4]">Trash</div>
+                  <h2 className="mt-2 text-2xl font-semibold text-white">Archived items</h2>
+                  <p className="mt-2 text-sm text-[#b5bac1]">Restore pages, databases, and projects from here.</p>
+                </div>
+                <button onClick={() => setShowTrash(false)} className="text-sm text-[#b5bac1] hover:text-white">
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="grid min-h-0 flex-1 gap-0 md:grid-cols-2">
+              <section className="min-h-0 border-r border-[#1E1F22] p-6">
+                <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Workspace Nodes</div>
+                <div className="mt-4 max-h-full space-y-3 overflow-y-auto">
+                  {trashNodes.map((node) => (
+                    <div key={node.id} className="rounded-2xl border border-[#1E1F22] bg-[#2B2D31] p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-white">{node.title}</div>
+                          <div className="mt-1 text-xs uppercase tracking-[0.16em] text-[#949ba4]">{node.nodeType}</div>
+                          <div className="mt-2 text-xs text-[#72757d]">Archived {new Date(node.archivedAt).toLocaleString()}</div>
+                        </div>
+                        <button
+                          onClick={() => restoreTrashNode(node.id)}
+                          className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-600"
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  {trashNodes.length === 0 && <div className="text-sm text-[#949ba4]">No archived pages or databases.</div>}
+                </div>
+              </section>
+              <section className="min-h-0 p-6">
+                <div className="text-xs uppercase tracking-[0.18em] text-[#949ba4]">Projects</div>
+                <div className="mt-4 max-h-full space-y-3 overflow-y-auto">
+                  {trashProjects.map((project) => (
+                    <div key={project.id} className="rounded-2xl border border-[#1E1F22] bg-[#2B2D31] p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-white">{project.title}</div>
+                          <div className="mt-1 text-xs uppercase tracking-[0.16em] text-[#949ba4]">project</div>
+                          <div className="mt-2 text-xs text-[#72757d]">Archived {new Date(project.archivedAt).toLocaleString()}</div>
+                        </div>
+                        <button
+                          onClick={() => restoreTrashProject(project.id)}
+                          className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-600"
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  {trashProjects.length === 0 && <div className="text-sm text-[#949ba4]">No archived projects.</div>}
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      )}
+
       {createModal.kind && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="w-full max-w-xl rounded-[28px] border border-[#1E1F22] bg-[#313338] p-6 shadow-2xl">
             <div className="text-[11px] uppercase tracking-[0.22em] text-[#949ba4]">
-              {createModal.kind === 'project' ? 'New Project' : createModal.kind === 'database' ? 'New Database' : 'New Page'}
+              {createModal.kind === 'project' ? 'New Project' : 'New Page'}
             </div>
             <h2 className="mt-3 text-2xl font-semibold text-white">
               {createModal.kind === 'project'
                 ? 'Create a project home with a built-in task board'
-                : createModal.kind === 'database'
-                  ? 'Create a reusable object database'
-                  : 'Create a new page'}
+                : 'Create a new page'}
             </h2>
 
             <div className="mt-5 space-y-4">
@@ -1623,7 +2405,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
               <input
                 value={newTitle}
                 onChange={(event) => setNewTitle(event.target.value)}
-                placeholder={createModal.kind === 'project' ? 'Project name' : createModal.kind === 'database' ? 'Database name' : 'Page title'}
+                placeholder={createModal.kind === 'project' ? 'Project name' : 'Page title'}
                 className="w-full rounded-2xl border border-[#3F4147] bg-[#1E1F22] px-4 py-3 text-white outline-none transition focus:border-indigo-500"
               />
               <textarea
@@ -1696,7 +2478,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
         </div>
       )}
 
-      {currentTask && taskDraft && projectPageDetail?.project && (
+      {currentTask && taskDraft && activeProject && (
         <div className="fixed inset-0 z-50 flex items-center justify-end bg-black/70">
           <div className="flex h-full w-full max-w-2xl flex-col overflow-hidden border-l border-[#1E1F22] bg-[#313338] shadow-2xl">
             <div className="border-b border-[#1E1F22] px-6 py-4">
@@ -1742,7 +2524,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                     onChange={(event) => setTaskDraft((prev) => (prev ? { ...prev, statusId: event.target.value } : prev))}
                     className="mt-2 w-full rounded-2xl border border-[#3F4147] bg-[#1E1F22] px-4 py-3 text-white outline-none transition focus:border-indigo-500"
                   >
-                    {projectPageDetail.project.statuses.map((status) => (
+                    {activeProject.statuses.map((status) => (
                       <option key={status.id} value={status.id}>{status.name}</option>
                     ))}
                   </select>
@@ -1770,7 +2552,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
                     className="mt-2 w-full rounded-2xl border border-[#3F4147] bg-[#1E1F22] px-4 py-3 text-white outline-none transition focus:border-indigo-500"
                   >
                     <option value="">Unassigned</option>
-                    {projectPageDetail.project.members.map((member) => (
+                    {activeProject.members.map((member) => (
                       <option key={member.username} value={member.username}>{member.username}</option>
                     ))}
                   </select>

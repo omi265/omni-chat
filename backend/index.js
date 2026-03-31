@@ -719,6 +719,55 @@ const emitWorkspaceError = (socket, message) => {
   socket.emit('workspace-error', { message });
 };
 
+const getWorkspaceTrash = (roomId) => {
+  const archivedNodes = db
+    .prepare(
+      `SELECT id, room_id, parent_id, node_type, title, icon, description, created_by, created_at, updated_at, archived_at
+       FROM workspace_nodes
+       WHERE room_id = ? AND archived_at IS NOT NULL
+       ORDER BY archived_at DESC`
+    )
+    .all(roomId)
+    .map((node) => ({
+      id: node.id,
+      roomId: node.room_id,
+      parentId: node.parent_id,
+      nodeType: node.node_type,
+      title: node.title,
+      icon: node.icon,
+      description: node.description || '',
+      createdBy: node.created_by,
+      createdAt: node.created_at,
+      updatedAt: node.updated_at,
+      archivedAt: node.archived_at,
+    }));
+
+  const archivedProjects = db
+    .prepare(
+      `SELECT id, room_id, name, description, created_by, created_at, updated_at, archived_at
+       FROM projects
+       WHERE room_id = ? AND archived_at IS NOT NULL
+       ORDER BY archived_at DESC`
+    )
+    .all(roomId)
+    .map((project) => ({
+      id: project.id,
+      roomId: project.room_id,
+      title: project.name,
+      description: project.description || '',
+      createdBy: project.created_by,
+      createdAt: project.created_at,
+      updatedAt: project.updated_at,
+      archivedAt: project.archived_at,
+      nodeType: 'project_page',
+    }));
+
+  return {
+    nodes: archivedNodes,
+    projects: archivedProjects,
+  };
+};
+
 const listWorkspaceNodes = (roomId) =>
   db
     .prepare(
@@ -765,6 +814,69 @@ const listChildWorkspaceNodes = (parentId) =>
 
 const getWorkspaceNode = (nodeId) =>
   db.prepare('SELECT * FROM workspace_nodes WHERE id = ? AND archived_at IS NULL').get(nodeId);
+
+const getWorkspaceNodeAnyState = (nodeId) =>
+  db.prepare('SELECT * FROM workspace_nodes WHERE id = ?').get(nodeId);
+
+const isWorkspaceDescendant = (nodeId, potentialAncestorId) => {
+  let current = getWorkspaceNode(nodeId);
+
+  while (current?.parent_id) {
+    if (current.parent_id === potentialAncestorId) return true;
+    current = getWorkspaceNode(current.parent_id);
+  }
+
+  return false;
+};
+
+const listWorkspaceSubtreeIds = (nodeId, includeArchived = false) => {
+  const ids = [nodeId];
+  const queue = [nodeId];
+
+  while (queue.length > 0) {
+    const currentId = queue.shift();
+    const children = db
+      .prepare(
+        `SELECT id
+         FROM workspace_nodes
+         WHERE parent_id = ?
+         ${includeArchived ? '' : 'AND archived_at IS NULL'}`
+      )
+      .all(currentId);
+
+    for (const child of children) {
+      ids.push(child.id);
+      queue.push(child.id);
+    }
+  }
+
+  return ids;
+};
+
+const listWorkspaceAncestors = (nodeId) => {
+  const ancestors = [];
+  let current = getWorkspaceNode(nodeId);
+
+  while (current?.parent_id) {
+    const parent = getWorkspaceNode(current.parent_id);
+    if (!parent) break;
+    ancestors.unshift({
+      id: parent.id,
+      roomId: parent.room_id,
+      parentId: parent.parent_id,
+      nodeType: parent.node_type,
+      title: parent.title,
+      icon: parent.icon,
+      description: parent.description || '',
+      createdBy: parent.created_by,
+      createdAt: parent.created_at,
+      updatedAt: parent.updated_at,
+    });
+    current = parent;
+  }
+
+  return ancestors;
+};
 
 const listPageBlocks = (nodeId) =>
   db
@@ -818,6 +930,7 @@ const getPageDetail = (nodeId) => {
     blocks: listPageBlocks(nodeId),
     backlinks: listNodeBacklinks(nodeId),
     childNodes: listChildWorkspaceNodes(nodeId),
+    ancestors: listWorkspaceAncestors(nodeId),
   };
 };
 
@@ -932,6 +1045,7 @@ const getDatabaseDetail = (nodeId, username) => {
     records: listDatabaseRecords(nodeId),
     backlinks: listNodeBacklinks(nodeId),
     project: getProjectDetailByDatabaseNodeId(nodeId, username),
+    ancestors: listWorkspaceAncestors(nodeId),
   };
 };
 
@@ -1696,19 +1810,26 @@ io.on('connection', (socket) => {
     socket.emit('workspace-tree-data', { roomId, nodes: listWorkspaceNodes(roomId) });
   });
 
+  socket.on('workspace-trash-request', ({ roomId, username }) => {
+    if (!isRoomMember(roomId, username)) {
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+    socket.emit('workspace-trash-data', { roomId, ...getWorkspaceTrash(roomId) });
+  });
+
   socket.on('workspace-node-create', ({ roomId, username, parentId, nodeType, title, description, icon }, callback) => {
     const ack = typeof callback === 'function' ? callback : () => {};
     if (!isRoomMember(roomId, username)) {
       ack({ ok: false, message: 'You are not a member of this workspace' });
       return emitWorkspaceError(socket, 'You are not a member of this workspace');
     }
-    if (!['page', 'database'].includes(nodeType)) {
+    if (nodeType !== 'page') {
       ack({ ok: false, message: 'Invalid workspace node type' });
       return emitWorkspaceError(socket, 'Invalid workspace node type');
     }
 
     const now = Date.now();
-    const nodeId = randomId(nodeType === 'page' ? 'page_' : 'db_');
+    const nodeId = randomId('page_');
     db.prepare(
       'INSERT INTO workspace_nodes (id, room_id, parent_id, node_type, title, icon, description, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
@@ -1716,7 +1837,7 @@ io.on('connection', (socket) => {
       roomId,
       parentId || null,
       nodeType,
-      title?.trim() || (nodeType === 'page' ? 'Untitled Page' : 'Untitled Database'),
+      title?.trim() || 'Untitled Page',
       icon || null,
       description?.trim() || '',
       username,
@@ -1724,17 +1845,118 @@ io.on('connection', (socket) => {
       now
     );
 
-    if (nodeType === 'page') {
-      db.prepare(
-        'INSERT INTO page_blocks (id, node_id, block_type, content, order_index, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(randomId('blk_'), nodeId, 'paragraph', '', 0, username, now, now);
-    } else {
-      db.prepare('INSERT INTO database_schemas (node_id, description) VALUES (?, ?)').run(nodeId, description?.trim() || '');
-      ensureDefaultDatabaseTemplate(nodeId);
-    }
+    db.prepare(
+      'INSERT INTO page_blocks (id, node_id, block_type, content, order_index, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(randomId('blk_'), nodeId, 'paragraph', '', 0, username, now, now);
 
     emitWorkspaceChanged(roomId, nodeId);
     ack({ ok: true, nodeId });
+  });
+
+  socket.on('workspace-node-archive', ({ nodeId, username }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node) {
+      ack({ ok: false, message: 'Workspace item not found' });
+      return emitWorkspaceError(socket, 'Workspace item not found');
+    }
+    if (node.node_type === 'project_page') {
+      ack({ ok: false, message: 'Archive projects from the project controls' });
+      return emitWorkspaceError(socket, 'Archive projects from the project controls');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    const now = Date.now();
+    const subtreeIds = listWorkspaceSubtreeIds(nodeId);
+    const updateNodeArchive = db.prepare('UPDATE workspace_nodes SET archived_at = ?, updated_at = ? WHERE id = ?');
+    const updateRecordArchive = db.prepare('UPDATE database_records SET archived_at = ?, updated_at = ? WHERE node_id = ?');
+    for (const entryId of subtreeIds) {
+      updateNodeArchive.run(now, now, entryId);
+      const entryNode = getWorkspaceNodeAnyState(entryId);
+      if (entryNode?.node_type === 'database') {
+        updateRecordArchive.run(now, now, entryId);
+      }
+    }
+    emitWorkspaceChanged(node.room_id, node.parent_id || null);
+    ack({ ok: true });
+  });
+
+  socket.on('workspace-node-restore', ({ nodeId, username }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNodeAnyState(nodeId);
+    if (!node || node.archived_at == null) {
+      ack({ ok: false, message: 'Archived workspace item not found' });
+      return emitWorkspaceError(socket, 'Archived workspace item not found');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+    if (node.node_type === 'project_page') {
+      ack({ ok: false, message: 'Restore projects from the project controls' });
+      return emitWorkspaceError(socket, 'Restore projects from the project controls');
+    }
+
+    const subtreeIds = listWorkspaceSubtreeIds(nodeId, true);
+    const restoreNode = db.prepare('UPDATE workspace_nodes SET archived_at = NULL, updated_at = ? WHERE id = ?');
+    const restoreRecords = db.prepare('UPDATE database_records SET archived_at = NULL, updated_at = ? WHERE node_id = ?');
+    const now = Date.now();
+    for (const entryId of subtreeIds) {
+      restoreNode.run(now, entryId);
+      const entryNode = getWorkspaceNodeAnyState(entryId);
+      if (entryNode?.node_type === 'database') {
+        restoreRecords.run(now, entryId);
+      }
+    }
+
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
+  });
+
+  socket.on('workspace-node-move', ({ nodeId, parentId, username }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node) {
+      ack({ ok: false, message: 'Workspace item not found' });
+      return emitWorkspaceError(socket, 'Workspace item not found');
+    }
+    if (node.node_type === 'project_page') {
+      ack({ ok: false, message: 'Projects stay at the root level' });
+      return emitWorkspaceError(socket, 'Projects stay at the root level');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    const nextParentId = parentId || null;
+    if (nextParentId === nodeId) {
+      ack({ ok: false, message: 'A node cannot be moved inside itself' });
+      return emitWorkspaceError(socket, 'A node cannot be moved inside itself');
+    }
+
+    if (nextParentId) {
+      const parentNode = getWorkspaceNode(nextParentId);
+      if (!parentNode || parentNode.room_id !== node.room_id) {
+        ack({ ok: false, message: 'Target location not found' });
+        return emitWorkspaceError(socket, 'Target location not found');
+      }
+      if (!['page', 'project_page'].includes(parentNode.node_type)) {
+        ack({ ok: false, message: 'Items can only be moved into pages or projects' });
+        return emitWorkspaceError(socket, 'Items can only be moved into pages or projects');
+      }
+      if (isWorkspaceDescendant(nextParentId, nodeId)) {
+        ack({ ok: false, message: 'A node cannot be moved into one of its descendants' });
+        return emitWorkspaceError(socket, 'A node cannot be moved into one of its descendants');
+      }
+    }
+
+    db.prepare('UPDATE workspace_nodes SET parent_id = ?, updated_at = ? WHERE id = ?').run(nextParentId, Date.now(), nodeId);
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
   });
 
   socket.on('workspace-page-get', ({ roomId, nodeId, username }) => {
@@ -1859,6 +2081,35 @@ io.on('connection', (socket) => {
     ack({ ok: true });
   });
 
+  socket.on('workspace-database-view-update', ({ nodeId, viewId, username, config }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node || node.node_type !== 'database') {
+      ack({ ok: false, message: 'Database not found' });
+      return emitWorkspaceError(socket, 'Database not found');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    const view = db.prepare('SELECT id, config_json FROM database_views WHERE id = ? AND node_id = ?').get(viewId, nodeId);
+    if (!view) {
+      ack({ ok: false, message: 'View not found' });
+      return emitWorkspaceError(socket, 'View not found');
+    }
+
+    const nextConfig = typeof config === 'object' && config !== null ? config : parseJson(view.config_json, {});
+    db.prepare('UPDATE database_views SET config_json = ? WHERE id = ? AND node_id = ?').run(
+      JSON.stringify(nextConfig),
+      viewId,
+      nodeId
+    );
+    db.prepare('UPDATE workspace_nodes SET updated_at = ? WHERE id = ?').run(Date.now(), nodeId);
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
+  });
+
   socket.on('workspace-database-property-create', ({ nodeId, username, name, propertyType }, callback) => {
     const ack = typeof callback === 'function' ? callback : () => {};
     const node = getWorkspaceNode(nodeId);
@@ -1883,6 +2134,57 @@ io.on('connection', (socket) => {
     db.prepare('UPDATE workspace_nodes SET updated_at = ? WHERE id = ?').run(Date.now(), nodeId);
     emitWorkspaceChanged(node.room_id, nodeId);
     ack({ ok: true, propertyId });
+  });
+
+  socket.on('workspace-database-property-update', ({ nodeId, propertyId, username, name, config }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node || node.node_type !== 'database') {
+      ack({ ok: false, message: 'Database not found' });
+      return emitWorkspaceError(socket, 'Database not found');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    const property = db.prepare('SELECT id, property_type, config_json FROM database_properties WHERE id = ? AND node_id = ?').get(propertyId, nodeId);
+    if (!property) {
+      ack({ ok: false, message: 'Property not found' });
+      return emitWorkspaceError(socket, 'Property not found');
+    }
+
+    const nextName = name?.trim() || 'Untitled Property';
+    const nextConfig = typeof config === 'object' && config !== null ? config : parseJson(property.config_json, {});
+
+    db.prepare('UPDATE database_properties SET name = ?, config_json = ? WHERE id = ? AND node_id = ?').run(
+      nextName,
+      JSON.stringify(nextConfig),
+      propertyId,
+      nodeId
+    );
+    db.prepare('UPDATE workspace_nodes SET updated_at = ? WHERE id = ?').run(Date.now(), nodeId);
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
+  });
+
+  socket.on('workspace-database-property-delete', ({ nodeId, propertyId, username }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node || node.node_type !== 'database') {
+      ack({ ok: false, message: 'Database not found' });
+      return emitWorkspaceError(socket, 'Database not found');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    db.prepare('DELETE FROM database_properties WHERE id = ? AND node_id = ?').run(propertyId, nodeId);
+    db.prepare('DELETE FROM database_record_values WHERE property_id = ?').run(propertyId);
+    db.prepare('UPDATE workspace_nodes SET updated_at = ? WHERE id = ?').run(Date.now(), nodeId);
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
   });
 
   socket.on('workspace-database-record-create', ({ nodeId, username, title }, callback) => {
@@ -1957,6 +2259,29 @@ io.on('connection', (socket) => {
     ack({ ok: true });
   });
 
+  socket.on('workspace-database-record-delete', ({ nodeId, recordId, username }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const node = getWorkspaceNode(nodeId);
+    if (!node || node.node_type !== 'database') {
+      ack({ ok: false, message: 'Database not found' });
+      return emitWorkspaceError(socket, 'Database not found');
+    }
+    if (!isRoomMember(node.room_id, username)) {
+      ack({ ok: false, message: 'You are not a member of this workspace' });
+      return emitWorkspaceError(socket, 'You are not a member of this workspace');
+    }
+
+    db.prepare('UPDATE database_records SET archived_at = ?, updated_at = ? WHERE id = ? AND node_id = ?').run(
+      Date.now(),
+      Date.now(),
+      recordId,
+      nodeId
+    );
+    db.prepare('UPDATE workspace_nodes SET updated_at = ? WHERE id = ?').run(Date.now(), nodeId);
+    emitWorkspaceChanged(node.room_id, nodeId);
+    ack({ ok: true });
+  });
+
   socket.on('project-update', ({ projectId, username, name, description }) => {
     const permission = requireProjectRole(projectId, username, ['project_owner', 'project_editor']);
     if (!permission.ok) return emitProjectError(socket, permission.error);
@@ -1996,15 +2321,44 @@ io.on('connection', (socket) => {
     db.prepare('UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?').run(now, now, projectId);
     const projectPageLink = getProjectPageLinkByProjectId(projectId);
     if (projectPageLink) {
-      db.prepare('UPDATE workspace_nodes SET archived_at = ?, updated_at = ? WHERE id = ? OR parent_id = ?').run(
-        now,
-        now,
-        projectPageLink.node_id,
-        projectPageLink.node_id
-      );
+      const subtreeIds = listWorkspaceSubtreeIds(projectPageLink.node_id);
+      const updateNodeArchive = db.prepare('UPDATE workspace_nodes SET archived_at = ?, updated_at = ? WHERE id = ?');
+      const updateRecordArchive = db.prepare('UPDATE database_records SET archived_at = ?, updated_at = ? WHERE node_id = ?');
+      for (const entryId of subtreeIds) {
+        updateNodeArchive.run(now, now, entryId);
+        const entryNode = getWorkspaceNodeAnyState(entryId);
+        if (entryNode?.node_type === 'database') {
+          updateRecordArchive.run(now, now, entryId);
+        }
+      }
       emitWorkspaceChanged(permission.project.room_id, projectPageLink.node_id);
     }
     emitProjectsChanged(permission.project.room_id, projectId);
+  });
+
+  socket.on('project-restore', ({ projectId, username }) => {
+    const project = db.prepare('SELECT * FROM projects WHERE id = ? AND archived_at IS NOT NULL').get(projectId);
+    if (!project) return emitProjectError(socket, 'Archived project not found');
+    const roomRole = getRoomRole(project.room_id, username);
+    if (roomRole !== 'owner') return emitProjectError(socket, 'Only workspace owners can restore archived projects');
+
+    const now = Date.now();
+    db.prepare('UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?').run(now, projectId);
+    const projectPageLink = getProjectPageLinkByProjectId(projectId);
+    if (projectPageLink) {
+      const subtreeIds = listWorkspaceSubtreeIds(projectPageLink.node_id, true);
+      const restoreNode = db.prepare('UPDATE workspace_nodes SET archived_at = NULL, updated_at = ? WHERE id = ?');
+      const restoreRecords = db.prepare('UPDATE database_records SET archived_at = NULL, updated_at = ? WHERE node_id = ?');
+      for (const entryId of subtreeIds) {
+        restoreNode.run(now, entryId);
+        const entryNode = getWorkspaceNodeAnyState(entryId);
+        if (entryNode?.node_type === 'database') {
+          restoreRecords.run(now, entryId);
+        }
+      }
+      emitWorkspaceChanged(project.room_id, projectPageLink.node_id);
+    }
+    emitProjectsChanged(project.room_id, projectId);
   });
 
   socket.on('project-member-set', ({ projectId, username, targetUsername, role }) => {
