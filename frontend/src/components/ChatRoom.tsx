@@ -504,7 +504,7 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
                   ref={scrollRef}
                   className="h-full overflow-y-auto custom-scrollbar rounded-lg border border-[#1E1F22] bg-[#2B2D31]/35 text-left shadow-inner"
                 >
-                  <div className="flex flex-col justify-end min-h-full">
+                  <div className="flex flex-col justify-end min-h-full pb-6">
                     <div className="py-12 px-4 mb-4 border-b border-[#3F4147]/20 text-center">
                       <div className="w-20 h-24 mx-auto flex items-center justify-center text-white text-4xl font-bold mb-4 shadow-2xl rounded-lg" style={{ backgroundColor: avatarColor }}>#</div>
                       <h1 className="text-2xl md:text-3xl font-bold text-white mb-1 leading-tight">Welcome to #{activeChannel?.name || 'general'}!</h1>
