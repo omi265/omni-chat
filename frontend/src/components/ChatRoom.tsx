@@ -64,6 +64,7 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
   const isVoiceView = activeChannel?.type === 'voice';
   const serverName = roomId.split(':')[0];
   const serverSecret = roomId.split(':')[1] || '';
+  const serverVisibility = serverSecret ? 'private' : 'public';
 
   useEffect(() => {
     if (currentVoiceChannelId) broadcastSpeaking(isLocallySpeaking);
@@ -563,8 +564,13 @@ export default function ChatRoom({ roomId, username, joinedServers, onSwitchServ
             <h2 className="text-2xl font-bold text-white mb-4 font-sans">Server Settings</h2>
             <div className="space-y-4">
               <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Server Name</label><div className="bg-[#1E1F22] p-3 rounded mt-1 font-mono text-sm text-indigo-400 border border-white/5">{serverName}</div></div>
-              <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Secret Passphrase</label><div className="bg-[#1E1F22] p-3 rounded mt-1 font-mono text-sm text-green-400 break-all border border-white/5">{serverSecret}</div></div>
-              <div className="p-4 bg-indigo-500/10 border border-indigo-500/30 rounded text-xs text-indigo-200 leading-relaxed italic">Share these credentials with trusted team members to join this encrypted space.</div>
+              <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Visibility</label><div className="bg-[#1E1F22] p-3 rounded mt-1 font-mono text-sm text-amber-300 border border-white/5">{serverVisibility}</div></div>
+              {serverSecret ? (
+                <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Secret Passphrase</label><div className="bg-[#1E1F22] p-3 rounded mt-1 font-mono text-sm text-green-400 break-all border border-white/5">{serverSecret}</div></div>
+              ) : (
+                <div className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded text-xs text-emerald-200 leading-relaxed italic">This server is public and visible on the post-login home screen for anyone to join.</div>
+              )}
+              {serverSecret && <div className="p-4 bg-indigo-500/10 border border-indigo-500/30 rounded text-xs text-indigo-200 leading-relaxed italic">Share these credentials with trusted team members to join this encrypted space.</div>}
             </div>
             <div className="mt-8 flex justify-end">
               <button onClick={() => setShowServerInfo(false)} className="bg-indigo-500 hover:bg-indigo-600 text-white px-8 py-2 rounded font-bold shadow-lg transition-transform active:scale-95">Close</button>

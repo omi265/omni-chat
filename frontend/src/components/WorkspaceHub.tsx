@@ -251,6 +251,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
   const [createModal, setCreateModal] = useState<CreateModalState>({ kind: null, parentId: null });
   const [newTitle, setNewTitle] = useState('');
   const [newDescription, setNewDescription] = useState('');
+  const [pageParentId, setPageParentId] = useState<string>('standalone');
   const [error, setError] = useState<string | null>(null);
   const [newPropertyName, setNewPropertyName] = useState('');
   const [newPropertyType, setNewPropertyType] = useState<PropertyType>('text');
@@ -471,6 +472,7 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
     setCreateModal({ kind, parentId });
     setNewTitle('');
     setNewDescription('');
+    setPageParentId(parentId || 'standalone');
   };
 
   const createNode = () => {
@@ -513,7 +515,9 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
       {
         roomId,
         username,
-        parentId: createModal.parentId,
+        parentId: createModal.kind === 'page'
+          ? (createModal.parentId || (pageParentId === 'standalone' ? null : pageParentId))
+          : createModal.parentId,
         nodeType: createModal.kind,
         title: newTitle,
         description: newDescription,
@@ -524,10 +528,13 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
           return;
         }
         setCreateModal({ kind: null, parentId: null });
+        const nextParentId = createModal.kind === 'page'
+          ? (createModal.parentId || (pageParentId === 'standalone' ? null : pageParentId))
+          : createModal.parentId;
         const nextNode = {
           id: response.nodeId,
           roomId,
-          parentId: createModal.parentId,
+          parentId: nextParentId,
           nodeType: createModal.kind as NodeType,
           title: newTitle.trim(),
           description: newDescription.trim(),
@@ -1596,6 +1603,23 @@ export default function WorkspaceHub({ roomId, username, workspaceReady }: Works
             </h2>
 
             <div className="mt-5 space-y-4">
+              {createModal.kind === 'page' && !createModal.parentId && projectNodes.length > 0 && (
+                <div>
+                  <div className="mb-2 text-[11px] uppercase tracking-[0.18em] text-[#949ba4]">Place Inside</div>
+                  <select
+                    value={pageParentId}
+                    onChange={(event) => setPageParentId(event.target.value)}
+                    className="w-full rounded-2xl border border-[#3F4147] bg-[#1E1F22] px-4 py-3 text-white outline-none transition focus:border-indigo-500"
+                  >
+                    <option value="standalone">Standalone page</option>
+                    {projectNodes.map((projectNode) => (
+                      <option key={projectNode.id} value={projectNode.id}>
+                        Project: {projectNode.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <input
                 value={newTitle}
                 onChange={(event) => setNewTitle(event.target.value)}

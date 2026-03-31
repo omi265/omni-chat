@@ -75,6 +75,17 @@ db.exec(`
     avatarUrl TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private',
+    passphrase TEXT,
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    archived_at INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS room_members (
     room_id TEXT,
     username TEXT,
@@ -283,6 +294,11 @@ db.exec(`
 `);
 
 try {
+  const roomsInfo = db.prepare('PRAGMA table_info(rooms)').all();
+  if (roomsInfo.length > 0 && !roomsInfo.some((col) => col.name === 'archived_at')) {
+    db.prepare('ALTER TABLE rooms ADD COLUMN archived_at INTEGER').run();
+  }
+
   const roomMessagesInfo = db.prepare('PRAGMA table_info(room_messages)').all();
   if (!roomMessagesInfo.some((col) => col.name === 'channel_id')) {
     db.prepare("ALTER TABLE room_messages ADD COLUMN channel_id TEXT NOT NULL DEFAULT 'general'").run();
@@ -324,6 +340,30 @@ try {
   console.error('Migration error', error);
 }
 
+const existingRoomIds = db.prepare('SELECT DISTINCT room_id FROM room_members').all().map((row) => row.room_id);
+const insertRoomFromMembership = db.prepare(
+  'INSERT OR IGNORE INTO rooms (id, name, visibility, passphrase, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+);
+
+for (const roomId of existingRoomIds) {
+  const separatorIndex = roomId.indexOf(':');
+  const name = separatorIndex === -1 ? roomId : roomId.slice(0, separatorIndex);
+  const passphrase = separatorIndex === -1 ? null : roomId.slice(separatorIndex + 1);
+  const ownerRow = db
+    .prepare("SELECT username FROM room_members WHERE room_id = ? ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, username ASC LIMIT 1")
+    .get(roomId);
+
+  insertRoomFromMembership.run(
+    roomId,
+    name,
+    passphrase ? 'private' : 'public',
+    passphrase,
+    ownerRow?.username || SUPER_ADMIN,
+    Date.now(),
+    Date.now()
+  );
+}
+
 const minioClient = new Minio.Client({
   endPoint: MINIO_ENDPOINT,
   port: MINIO_PORT,
@@ -335,6 +375,26 @@ const minioClient = new Minio.Client({
 let minioReadyPromise = null;
 
 const onlineUsers = new Map();
+
+const parseRoomId = (roomId) => {
+  const separatorIndex = roomId.indexOf(':');
+  if (separatorIndex === -1) {
+    return { name: roomId, passphrase: '' };
+  }
+
+  return {
+    name: roomId.slice(0, separatorIndex),
+    passphrase: roomId.slice(separatorIndex + 1),
+  };
+};
+
+const normalizeRoomName = (value) => (value || '').trim().replace(/\s+/g, ' ');
+
+const buildRoomId = ({ name, passphrase, visibility }) =>
+  visibility === 'public' ? normalizeRoomName(name) : `${normalizeRoomName(name)}:${(passphrase || '').trim()}`;
+
+const getRoomRow = (roomId) =>
+  db.prepare('SELECT * FROM rooms WHERE id = ? AND archived_at IS NULL').get(roomId);
 
 const getRoomRole = (roomId, username) => {
   const row = db.prepare('SELECT role FROM room_members WHERE room_id = ? AND username = ?').get(roomId, username);
@@ -352,6 +412,52 @@ const ensureRoomMembership = (roomId, username) => {
 };
 
 const isRoomMember = (roomId, username) => !!getRoomRole(roomId, username);
+
+const serializeRoom = (roomRow, username = null) => {
+  const memberCount = db.prepare('SELECT COUNT(*) AS count FROM room_members WHERE room_id = ?').get(roomRow.id).count;
+  return {
+    id: roomRow.id,
+    name: roomRow.name,
+    visibility: roomRow.visibility,
+    memberCount,
+    joined: username ? isRoomMember(roomRow.id, username) : false,
+  };
+};
+
+const listUserRooms = (username) =>
+  db
+    .prepare(
+      `SELECT r.*
+       FROM rooms r
+       JOIN room_members rm ON rm.room_id = r.id
+       WHERE rm.username = ? AND r.archived_at IS NULL
+       ORDER BY r.updated_at DESC, r.name COLLATE NOCASE ASC`
+    )
+    .all(username)
+    .map((room) => serializeRoom(room, username));
+
+const listPublicRooms = (username = null) =>
+  db
+    .prepare(
+      `SELECT *
+       FROM rooms
+       WHERE visibility = 'public' AND archived_at IS NULL
+       ORDER BY updated_at DESC, name COLLATE NOCASE ASC`
+    )
+    .all()
+    .map((room) => serializeRoom(room, username));
+
+const createRoomRecord = ({ name, passphrase = '', visibility, username, now = Date.now() }) => {
+  const roomName = normalizeRoomName(name);
+  const roomPassphrase = visibility === 'private' ? passphrase.trim() : null;
+  const roomId = buildRoomId({ name: roomName, passphrase: roomPassphrase || '', visibility });
+
+  db.prepare(
+    'INSERT INTO rooms (id, name, visibility, passphrase, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(roomId, roomName, visibility, roomPassphrase, username, now, now);
+
+  return getRoomRow(roomId);
+};
 
 const getWorkspaceMembers = (roomId) =>
   db
@@ -556,6 +662,14 @@ const emitProjectsChanged = (roomId, projectId = null) => {
 
 const emitProjectError = (socket, message) => {
   socket.emit('project-error', { message });
+};
+
+const emitRoomsChanged = (roomId = null) => {
+  io.emit('rooms-changed', { roomId });
+};
+
+const emitRoomDeleted = (roomId) => {
+  io.to(roomId).emit('room-deleted', { roomId });
 };
 
 const createWorkspaceNode = ({ roomId, parentId = null, nodeType, title, description = '', icon = null, username, now = Date.now() }) => {
@@ -1096,12 +1210,14 @@ io.on('connection', (socket) => {
 
   socket.on('admin-get-rooms', ({ username }) => {
     if (username !== SUPER_ADMIN) return;
-    const rooms = db.prepare('SELECT DISTINCT room_id FROM room_members').all();
+    const rooms = db.prepare('SELECT * FROM rooms WHERE archived_at IS NULL ORDER BY updated_at DESC, name COLLATE NOCASE ASC').all();
     socket.emit(
       'admin-rooms-list',
       rooms.map((room) => ({
-        id: room.room_id,
-        members: db.prepare('SELECT username, role FROM room_members WHERE room_id = ?').all(room.room_id),
+        id: room.id,
+        name: room.name,
+        visibility: room.visibility,
+        members: db.prepare('SELECT username, role FROM room_members WHERE room_id = ?').all(room.id),
       }))
     );
   });
@@ -1110,7 +1226,14 @@ io.on('connection', (socket) => {
     if (username !== SUPER_ADMIN) return;
     const users = db.prepare('SELECT username, avatarColor, avatarUrl FROM users').all();
     const usersWithStats = users.map((user) => {
-      const joinedRooms = db.prepare('SELECT room_id FROM room_members WHERE username = ?').all(user.username);
+      const joinedRooms = db
+        .prepare(
+          `SELECT rm.room_id
+           FROM room_members rm
+           JOIN rooms r ON r.id = rm.room_id
+           WHERE rm.username = ? AND r.archived_at IS NULL`
+        )
+        .all(user.username);
       return { ...user, serverCount: joinedRooms.length, servers: joinedRooms.map((room) => room.room_id) };
     });
     socket.emit('admin-users-list', usersWithStats);
@@ -1131,6 +1254,7 @@ io.on('connection', (socket) => {
   socket.on('admin-delete-room', ({ username, roomId }) => {
     if (username !== SUPER_ADMIN) return;
 
+    emitRoomDeleted(roomId);
     const projectIds = db.prepare('SELECT id FROM projects WHERE room_id = ?').all(roomId).map((row) => row.id);
     for (const projectId of projectIds) {
       db.prepare('DELETE FROM task_attachments WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)').run(projectId);
@@ -1141,20 +1265,70 @@ io.on('connection', (socket) => {
       db.prepare('DELETE FROM project_members WHERE project_id = ?').run(projectId);
     }
 
+    db.prepare('UPDATE rooms SET archived_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), roomId);
     db.prepare('DELETE FROM projects WHERE room_id = ?').run(roomId);
     db.prepare('DELETE FROM room_members WHERE room_id = ?').run(roomId);
     db.prepare('DELETE FROM room_messages WHERE room_id = ?').run(roomId);
     db.prepare('DELETE FROM room_files WHERE room_id = ?').run(roomId);
     db.prepare('DELETE FROM channels WHERE room_id = ?').run(roomId);
 
-    const rooms = db.prepare('SELECT DISTINCT room_id FROM room_members').all();
+    emitRoomsChanged(roomId);
+    const rooms = db.prepare('SELECT * FROM rooms WHERE archived_at IS NULL ORDER BY updated_at DESC, name COLLATE NOCASE ASC').all();
     socket.emit(
       'admin-rooms-list',
       rooms.map((room) => ({
-        id: room.room_id,
-        members: db.prepare('SELECT username, role FROM room_members WHERE room_id = ?').all(room.room_id),
+        id: room.id,
+        name: room.name,
+        visibility: room.visibility,
+        members: db.prepare('SELECT username, role FROM room_members WHERE room_id = ?').all(room.id),
       }))
     );
+  });
+
+  socket.on('rooms-user-list-request', ({ username }) => {
+    socket.emit('rooms-user-list', { rooms: listUserRooms(username) });
+  });
+
+  socket.on('rooms-public-list-request', ({ username }) => {
+    socket.emit('rooms-public-list', { rooms: listPublicRooms(username) });
+  });
+
+  socket.on('room-access', ({ username, name, passphrase, visibility, createIfMissing }, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    const user = db.prepare('SELECT username FROM users WHERE username = ?').get(username);
+    if (!user) {
+      return ack({ ok: false, message: 'User must be registered before joining a server' });
+    }
+
+    const roomName = normalizeRoomName(name);
+    const roomVisibility = visibility === 'public' ? 'public' : 'private';
+    const roomPassphrase = (passphrase || '').trim();
+    if (!roomName) {
+      return ack({ ok: false, message: 'Server name is required' });
+    }
+    if (roomVisibility === 'private' && !roomPassphrase) {
+      return ack({ ok: false, message: 'Passphrase is required for private servers' });
+    }
+
+    const roomId = buildRoomId({ name: roomName, passphrase: roomPassphrase, visibility: roomVisibility });
+    let room = getRoomRow(roomId);
+
+    if (!room) {
+      if (!createIfMissing) {
+        return ack({ ok: false, message: roomVisibility === 'public' ? 'Public server not found' : 'Private server not found' });
+      }
+      room = createRoomRecord({
+        name: roomName,
+        passphrase: roomPassphrase,
+        visibility: roomVisibility,
+        username,
+      });
+    }
+
+    const role = ensureRoomMembership(room.id, username);
+    db.prepare('UPDATE rooms SET updated_at = ? WHERE id = ?').run(Date.now(), room.id);
+    emitRoomsChanged(room.id);
+    ack({ ok: true, room: serializeRoom(room, username), role });
   });
 
   socket.on('workspace-join', ({ roomId, username }, callback) => {
@@ -1163,6 +1337,10 @@ io.on('connection', (socket) => {
     if (!user) {
       ack({ ok: false, message: 'User must be registered before joining a workspace' });
       return emitWorkspaceError(socket, 'User must be registered before joining a workspace');
+    }
+    if (!getRoomRow(roomId)) {
+      ack({ ok: false, message: 'This server no longer exists' });
+      return emitWorkspaceError(socket, 'This server no longer exists');
     }
 
     socket.join(roomId);
@@ -1180,6 +1358,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join-room', ({ roomId, username }) => {
+    if (!getRoomRow(roomId)) {
+      socket.emit('room-deleted', { roomId });
+      return;
+    }
+
     socket.join(roomId);
     const existing = onlineUsers.get(socket.id);
     onlineUsers.set(socket.id, { username, roomId, voiceChannelId: existing?.voiceChannelId || null });

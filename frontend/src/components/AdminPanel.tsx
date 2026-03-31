@@ -10,6 +10,8 @@ interface AdminPanelProps {
 
 interface RoomInfo {
   id: string;
+  name?: string;
+  visibility?: 'public' | 'private';
   members: { username: string; role: string }[];
 }
 
@@ -113,7 +115,7 @@ export default function AdminPanel({ username, onClose }: AdminPanelProps) {
                       <svg className={`w-4 h-4 text-gray-500 transition-transform ${expandedId === room.id ? 'rotate-90' : ''}`} fill="currentColor" viewBox="0 0 20 20"><path d="M6 6L14 10L6 14V6Z" /></svg>
                       <div>
                         <div className="text-lg font-bold text-white group-hover:text-indigo-400 transition-colors">#{room.id.split(':')[0]}</div>
-                        <div className="text-xs text-gray-400 font-medium">{room.members.length} members</div>
+                        <div className="text-xs text-gray-400 font-medium">{room.members.length} members · {room.visibility || 'private'}</div>
                       </div>
                     </div>
                     <div className="flex space-x-2">
